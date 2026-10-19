@@ -1,0 +1,17 @@
+[package]
+name = "gctl-proto"
+description = "Wire protocol for Glorious Core v1 wireless mice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["hidapi"]
+hidapi = ["dep:hidapi"]
+
+[dependencies]
+hidapi = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[lints]
+workspace = true

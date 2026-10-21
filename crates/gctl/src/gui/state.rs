@@ -58,7 +58,7 @@ impl Snapshot {
     /// The remembered binding for `button`, or `None` when nobody remembers
     /// one. Look-up is by button, never by a position the `Vec` length does
     /// not enforce.
-    fn bind(&self, button: Button) -> Option<Binding> {
+    pub(crate) fn bind(&self, button: Button) -> Option<Binding> {
         self.binds
             .iter()
             .find(|(candidate, _)| *candidate == button)
@@ -531,14 +531,14 @@ impl BrightnessOverlay {
 #[derive(Debug)]
 struct ButtonsOverlay {
     /// One entry per button, in the CLI's button order.
-    binds: Vec<Option<BindOverlay>>,
+    binds: [Option<BindOverlay>; BUTTONS.len()],
     scroll: Option<ScrollDirection>,
 }
 
 impl Default for ButtonsOverlay {
     fn default() -> Self {
         Self {
-            binds: vec![None; BUTTONS.len()],
+            binds: std::array::from_fn(|_| None),
             scroll: None,
         }
     }
@@ -804,10 +804,22 @@ impl State {
             return Some(reason);
         }
         if self.connection == Connection::Asleep {
-            return Some("the mouse is asleep; wake it to apply".to_owned());
+            return Some("the mouse is asleep; wake it to change the active profile".to_owned());
         }
         if self.live_snapshot().is_none() {
             return Some("reading the mouse".to_owned());
+        }
+        None
+    }
+
+    /// The reason export or import is refused, or `None` when either may run.
+    /// The Device pane's buttons and both start functions read this one gate.
+    pub(crate) fn file_blocked(&self) -> Option<String> {
+        if let Some(reason) = self.start_refused(StartKind::Transaction) {
+            return Some(reason);
+        }
+        if self.connection == Connection::Asleep {
+            return Some("the mouse is asleep; wake it to export or import".to_owned());
         }
         None
     }
@@ -1209,7 +1221,7 @@ impl State {
     }
 
     fn export(&mut self, path: PathBuf) -> Vec<Request> {
-        if self.start_refused(StartKind::Transaction).is_some() {
+        if self.file_blocked().is_some() {
             return Vec::new();
         }
         if path.as_os_str().is_empty() {
@@ -1224,7 +1236,7 @@ impl State {
     }
 
     fn import(&mut self, path: PathBuf) -> Vec<Request> {
-        if self.start_refused(StartKind::Transaction).is_some() {
+        if self.file_blocked().is_some() {
             return Vec::new();
         }
         if path.as_os_str().is_empty() {
@@ -1371,7 +1383,8 @@ impl State {
             Prompt::Discard(Leave::Profile(profile)) => {
                 self.prompt = None;
                 self.overlay = Overlay::default();
-                // The queued import was for the profile being left; drop it.
+                // Defensive: a pick is refused while an import runs, so no queued
+                // import can be open here; clearing keeps the switch total.
                 self.pending_import = None;
                 self.import_path = None;
                 self.import_carried = None;
@@ -1431,9 +1444,10 @@ impl State {
     ) {
         // The running import carries the profile it wrote; a successful answer
         // names it in the notice.
-        let import_profile = match self.in_flight {
-            Some(InFlight::Import(profile)) => Some(profile),
-            _ => None,
+        let import_profile = if let Some(InFlight::Import(profile)) = self.in_flight {
+            Some(profile)
+        } else {
+            None
         };
         self.in_flight = None;
         self.waiting = false;
@@ -1838,23 +1852,33 @@ impl State {
                 let Some(index) = BUTTONS.iter().position(|b| *b == button) else {
                     return Vec::new();
                 };
-                let entry = self.overlay.buttons.binds[index].get_or_insert_with(|| BindOverlay {
-                    binding: snap.bind(button),
-                    invalid: false,
-                });
-                entry.binding = Some(binding);
-                entry.invalid = false;
+                match &mut self.overlay.buttons.binds[index] {
+                    Some(entry) => {
+                        entry.binding = Some(binding);
+                        entry.invalid = false;
+                    }
+                    slot @ None => {
+                        *slot = Some(BindOverlay {
+                            binding: Some(binding),
+                            invalid: false,
+                        });
+                    }
+                }
                 Some(Carried::Bind(button))
             }
             Edit::InvalidBind(button) => {
                 let Some(index) = BUTTONS.iter().position(|b| *b == button) else {
                     return Vec::new();
                 };
-                let entry = self.overlay.buttons.binds[index].get_or_insert_with(|| BindOverlay {
-                    binding: snap.bind(button),
-                    invalid: false,
-                });
-                entry.invalid = true;
+                match &mut self.overlay.buttons.binds[index] {
+                    Some(entry) => entry.invalid = true,
+                    slot @ None => {
+                        *slot = Some(BindOverlay {
+                            binding: snap.bind(button),
+                            invalid: true,
+                        });
+                    }
+                }
                 None
             }
             Edit::Scroll(direction) => {

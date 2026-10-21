@@ -773,6 +773,59 @@ fn an_empty_path_during_a_read_leaves_the_read_running() {
 }
 
 #[test]
+fn an_asleep_mouse_blocks_export_and_import_with_their_own_reason() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Select(Section::Device));
+    assert_eq!(state.file_blocked(), None);
+    state.update(Msg::Loaded(Err(LoadError::Asleep)));
+    assert_eq!(
+        state.file_blocked().as_deref(),
+        Some("the mouse is asleep; wake it to export or import")
+    );
+    // the gate the buttons read is the gate the messages obey
+    assert!(
+        state
+            .update(Msg::Export(PathBuf::from("/x/p.toml")))
+            .is_empty()
+    );
+    assert!(
+        state
+            .update(Msg::Import(PathBuf::from("/x/p.toml")))
+            .is_empty()
+    );
+    assert_eq!(state.prompt(), None);
+    state.update(Msg::Loaded(Ok(snapshot())));
+    assert_eq!(state.file_blocked(), None);
+    assert_eq!(
+        state.update(Msg::Export(PathBuf::from("/x/p.toml"))).len(),
+        1
+    );
+}
+
+#[test]
+fn a_running_read_blocks_export_and_import_with_the_running_reason() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Tick);
+    assert_eq!(state.file_blocked().as_deref(), Some("reading the mouse"));
+}
+
+#[test]
+fn an_asleep_mouse_blocks_make_active_with_its_own_reason() {
+    let mut state = ready(snapshot());
+    state.update(Msg::PickProfile(profile(3)));
+    let mut three = snapshot();
+    three.profile = profile(3);
+    state.update(Msg::Loaded(Ok(three)));
+    assert_eq!(state.make_active_blocked(), None);
+    state.update(Msg::Loaded(Err(LoadError::Asleep)));
+    assert_eq!(
+        state.make_active_blocked().as_deref(),
+        Some("the mouse is asleep; wake it to change the active profile")
+    );
+    assert!(state.update(Msg::MakeActive).is_empty());
+}
+
+#[test]
 fn a_tick_while_ready_reloads_the_edited_profile_and_keeps_pending_edits() {
     let mut state = ready(snapshot());
     edit(&mut state, Edit::Debounce(4));

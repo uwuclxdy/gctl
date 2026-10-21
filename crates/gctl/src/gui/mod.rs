@@ -3,6 +3,7 @@
 
 pub(crate) mod io;
 pub(crate) mod state;
+mod theme;
 mod view;
 
 pub use view::run;

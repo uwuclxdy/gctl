@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use iced::futures::StreamExt;
 use iced::futures::channel::mpsc;
-use iced::theme::palette::Palette;
+use iced::theme::Mode;
 use iced::widget::{
     button, center, checkbox, column, container, pick_list, row, rule, scrollable, slider, space,
     stack, text, text_input, toggler,
@@ -20,85 +20,17 @@ use super::state::{
     Connection, Edit, EffectKind, ImportCheck, Leave, LoadError, Msg, Notice, Prompt, Request,
     Section, Snapshot, State, WriteFailure, button_label,
 };
+use super::theme::{self, CONTROL_HEIGHT, MONO_FONT, Scheme, UI_FONT};
 use crate::memory::Memory;
 use crate::parse;
 use crate::writes::WriteOp;
-
-// --- palette (dark block, converted from oklch by computation) -----------------
-
-// --bg: oklch(0.255 0.024 280)
-const BG: Color = Color::from_rgb8(0x20, 0x22, 0x2E);
-// --well: oklch(0.215 0.020 280)
-const WELL: Color = Color::from_rgb8(0x17, 0x19, 0x23);
-// --surface-1: oklch(0.300 0.024 280)
-const SURFACE_1: Color = Color::from_rgb8(0x2B, 0x2D, 0x3A);
-// --surface-2: oklch(0.345 0.026 280)
-const SURFACE_2: Color = Color::from_rgb8(0x36, 0x38, 0x47);
-// --surface-3: oklch(0.395 0.028 280)
-const SURFACE_3: Color = Color::from_rgb8(0x43, 0x45, 0x55);
-// --text: oklch(0.900 0.030 280)
-const TEXT: Color = Color::from_rgb8(0xDA, 0xDC, 0xF2);
-// --text-2: oklch(0.800 0.030 280)
-const TEXT_2: Color = Color::from_rgb8(0xB9, 0xBC, 0xD1);
-// --text-3: oklch(0.720 0.030 280)
-const TEXT_3: Color = Color::from_rgb8(0xA0, 0xA3, 0xB8);
-// --text-4: oklch(0.680 0.030 280)
-const TEXT_4: Color = Color::from_rgb8(0x94, 0x97, 0xAB);
-// --accent: oklch(0.76 0.110 238)
-const ACCENT: Color = Color::from_rgb8(0x68, 0xBB, 0xEF);
-// --accent-hover: oklch(0.82 0.115 238)
-const ACCENT_HOVER: Color = Color::from_rgb8(0x77, 0xCF, 0xFF);
-// --accent-press: oklch(0.70 0.105 238)
-const ACCENT_PRESS: Color = Color::from_rgb8(0x59, 0xA8, 0xD8);
-// --accent-text: oklch(0.82 0.115 238)
-const ACCENT_TEXT: Color = Color::from_rgb8(0x77, 0xCF, 0xFF);
-// --accent-quiet: oklch(0.76 0.110 238 / 0.16)
-const ACCENT_QUIET: Color = Color::from_rgba8(0x68, 0xBB, 0xEF, 0.16);
-// --accent-line: oklch(0.76 0.110 238 / 0.38)
-const ACCENT_LINE: Color = Color::from_rgba8(0x68, 0xBB, 0xEF, 0.38);
-// --on-accent: oklch(0.22 0.020 280)
-const ON_ACCENT: Color = Color::from_rgb8(0x19, 0x1A, 0x24);
-// --success: oklch(0.80 0.130 150)
-const SUCCESS: Color = Color::from_rgb8(0x7C, 0xD5, 0x91);
-// --warning: oklch(0.84 0.110 90)
-const WARNING: Color = Color::from_rgb8(0xE6, 0xC8, 0x73);
-// --danger: oklch(0.72 0.140 15)
-const DANGER: Color = Color::from_rgb8(0xEF, 0x7D, 0x88);
-// --danger-text: oklch(0.81 0.140 15)
-const DANGER_TEXT: Color = Color::from_rgb8(0xFF, 0x99, 0xA4);
-// --on-danger: oklch(0.22 0.02 15)
-const ON_DANGER: Color = Color::from_rgb8(0x23, 0x17, 0x18);
-// --line: oklch(0.345 0.026 280)
-const LINE: Color = Color::from_rgb8(0x36, 0x38, 0x47);
-
-fn palette() -> Palette {
-    Palette {
-        background: BG,
-        text: TEXT,
-        primary: ACCENT,
-        success: SUCCESS,
-        warning: WARNING,
-        danger: DANGER,
-    }
-}
-
-fn theme() -> iced::Theme {
-    iced::Theme::custom("gctl", palette())
-}
-
-/// The tick interval for the current connection.
-fn tick_interval(connection: Connection) -> Duration {
-    match connection {
-        Connection::Ready => Duration::from_secs(60),
-        Connection::Asleep => Duration::from_secs(5),
-        Connection::Loading | Connection::NoMouse | Connection::Failed => Duration::from_secs(3),
-    }
-}
 
 /// The window's own message type, wrapping the state machine's `Msg`.
 #[derive(Debug, Clone)]
 enum Message {
     Machine(Msg),
+    /// The desktop's colour scheme mode answered the boot query or changed.
+    Theme(Mode),
     Loaded {
         device: Option<DeviceHandle>,
         result: Result<Snapshot, LoadError>,
@@ -133,8 +65,8 @@ enum Message {
 /// The opened device handle, shared with the blocking transaction threads.
 type DeviceHandle = Arc<Mutex<Device<hidapi::HidDevice>>>;
 
-/// Everything the window carries besides the state machine: the opened device
-/// and the export/import path text.
+/// Everything the window carries besides the state machine: the opened device,
+/// the export/import path text, and the current colour scheme.
 struct Shell {
     machine: State,
     device: Option<DeviceHandle>,
@@ -142,6 +74,7 @@ struct Shell {
     lock_path: Option<PathBuf>,
     export_path: String,
     import_path: String,
+    scheme: Scheme,
 }
 
 #[derive(Clone)]
@@ -160,8 +93,11 @@ impl Shell {
             lock_path: flags.lock_path,
             export_path: String::new(),
             import_path: String::new(),
+            scheme: Scheme::Dark,
         };
-        let task = shell.run_requests(requests);
+        let mut task = shell.run_requests(requests);
+        // The desktop's mode answers asynchronously; dark holds until it does.
+        task = Task::batch([task, iced::system::theme().map(Message::Theme)]);
         (shell, task)
     }
 
@@ -170,6 +106,10 @@ impl Shell {
             Message::Machine(message) => {
                 let requests = self.machine.update(message);
                 self.run_requests(requests)
+            }
+            Message::Theme(mode) => {
+                self.scheme = Scheme::from_mode(mode);
+                Task::none()
             }
             Message::Loaded { device, result } => {
                 self.device = device;
@@ -239,8 +179,11 @@ impl Shell {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(tick_interval(self.machine.connection()))
-            .map(|_| Message::Machine(Msg::Tick))
+        Subscription::batch([
+            iced::time::every(tick_interval(self.machine.connection()))
+                .map(|_| Message::Machine(Msg::Tick)),
+            iced::system::theme_changes().map(Message::Theme),
+        ])
     }
 
     fn run_requests(&mut self, requests: Vec<Request>) -> Task<Message> {
@@ -618,6 +561,19 @@ fn reload(
     }
 }
 
+/// The window settings: 1024x680, app id `gctl` on Linux.
+pub(super) fn window_settings() -> iced::window::Settings {
+    let mut settings = iced::window::Settings {
+        size: Size::new(1024.0, 680.0),
+        ..iced::window::Settings::default()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        settings.platform_specific.application_id = "gctl".to_owned();
+    }
+    settings
+}
+
 /// Starts the window. `state_dir` and `lock_path` come from `main`.
 pub fn run(state_dir: Option<&Path>, lock_path: Option<PathBuf>) -> iced::Result {
     let flags = Flags {
@@ -626,20 +582,41 @@ pub fn run(state_dir: Option<&Path>, lock_path: Option<PathBuf>) -> iced::Result
     };
     let boot = move || Shell::boot(flags.clone());
     iced::application(boot, Shell::update, Shell::view)
-        .theme(|_shell: &Shell| theme())
+        .theme(|shell: &Shell| shell.theme())
         .subscription(Shell::subscription)
+        .window(window_settings())
         .title("gctl")
-        .window_size(Size::new(1024.0, 680.0))
         .run()
+}
+
+/// The tick interval for the current connection.
+fn tick_interval(connection: Connection) -> Duration {
+    match connection {
+        Connection::Ready => Duration::from_secs(60),
+        Connection::Asleep => Duration::from_secs(5),
+        Connection::Loading | Connection::NoMouse | Connection::Failed => Duration::from_secs(3),
+    }
 }
 
 // --- the view -----------------------------------------------------------------
 
 impl Shell {
+    /// The iced theme this shell's scheme carries; `run` hands it to iced.
+    fn theme(&self) -> iced::Theme {
+        self.scheme.theme()
+    }
+
     fn view(&self) -> Element<'_, Message> {
+        self.render(self.scheme)
+    }
+
+    /// The whole window under one scheme, shared by the live window and the
+    /// two-theme render tests.
+    fn render(&self, scheme: Scheme) -> Element<'_, Message> {
         let base: Element<'_, Message> = match self.machine.connection() {
-            Connection::Loading => center(text("Loading")).into(),
+            Connection::Loading => center(ui_text("Loading")).into(),
             Connection::NoMouse => empty_state(
+                scheme,
                 "No mouse found",
                 "Plug in a Glorious mouse, or install gctl's udev rule (70-gctl.rules) so your user can open its hidraw node."
                     .to_owned(),
@@ -649,76 +626,85 @@ impl Shell {
             {
                 match self.machine.connection() {
                     Connection::Asleep => empty_state(
+                        scheme,
                         "The mouse is asleep. Move it to wake it.",
                         String::new(),
                     ),
                     Connection::Failed => empty_state(
+                        scheme,
                         "Could not read the mouse",
-                        self.machine.error().unwrap_or_default().to_owned(),
+                        capitalize(self.machine.error().unwrap_or_default()),
                     ),
                     Connection::Loading | Connection::NoMouse | Connection::Ready => {
-                        center(text("Loading")).into()
+                        center(ui_text("Loading")).into()
                     }
                 }
             }
-            Connection::Asleep | Connection::Ready | Connection::Failed => self.main_view(),
+            Connection::Asleep | Connection::Ready | Connection::Failed => {
+                self.main_view(scheme)
+            }
         };
-        let overlay = self.modal();
+        let overlay = self.modal(scheme);
         match overlay {
             Some(modal) => stack![base, modal].into(),
             None => base,
         }
     }
 
-    fn modal(&self) -> Option<Element<'_, Message>> {
+    fn modal(&self, scheme: Scheme) -> Option<Element<'_, Message>> {
         let prompt = self.machine.prompt()?;
         let content = match &prompt {
-            Prompt::Discard(_) => discard_prompt(prompt, self.machine.section()),
-            Prompt::Import(_) => import_prompt(prompt),
+            Prompt::Discard(_) => discard_prompt(scheme, prompt, self.machine.section()),
+            Prompt::Import(_) => import_prompt(scheme, prompt),
         };
-        Some(opaque_modal(content))
+        Some(opaque_modal(scheme, content))
     }
 
-    fn main_view(&self) -> Element<'_, Message> {
+    fn main_view(&self, scheme: Scheme) -> Element<'_, Message> {
         let machine = &self.machine;
+        let t = scheme.tokens();
         let error_banner = machine.error().map(|error| {
-            container(text(error).color(DANGER_TEXT))
-                .style(surface(SURFACE_1))
+            container(ui_text(capitalize(error)).size(13).color(t.danger_text))
+                .style(theme::banner(scheme))
                 .width(Length::Fill)
-                .padding(8)
+                .padding([8.0, 12.0])
         });
-        let content = self.content_pane();
+        let content = self.content_pane(scheme);
         let mut page = column![];
         if let Some(banner) = error_banner {
             page = page.push(banner);
         }
-        page = page.push(row![self.sidebar(), content].height(Length::Fill));
+        page = page.push(row![self.sidebar(scheme), content].height(Length::Fill));
         page.into()
     }
 
-    fn sidebar(&self) -> Element<'_, Message> {
+    fn sidebar(&self, scheme: Scheme) -> Element<'_, Message> {
         let machine = &self.machine;
+        let t = scheme.tokens();
         let Some(snap) = machine.snapshot() else {
             return container(space()).width(220).into();
         };
 
-        let badge = if snap.model.tested {
-            Element::from(space())
-        } else {
-            container(text("Untested").size(11).color(ON_ACCENT))
-                .style(accent_fill())
-                .padding([2, 6])
-                .into()
-        };
         // The badge wraps under the model name, so the longest model name never
         // clips it against the fixed sidebar width.
-        let model_row = column![text(snap.model.name).size(18), badge]
-            .spacing(4)
-            .align_x(iced::Alignment::Start);
+        let mut model_row =
+            column![ui_text(snap.model.name).size(18)].align_x(iced::Alignment::Start);
+        if !snap.model.tested {
+            model_row = model_row.push(warning_tag(scheme, "Untested")).spacing(4);
+        }
 
-        let battery = match snap.battery.percent {
-            Some(percent) => format!("Battery {percent}%"),
-            None => "Battery unknown".to_owned(),
+        let battery: Element<'_, Message> = match snap.battery.percent {
+            Some(percent) => ui_text(format!("Battery {percent}%"))
+                .size(13)
+                .color(t.text_2)
+                .into(),
+            None => row![
+                ui_text("Battery").size(13).color(t.text_2),
+                tag(scheme, "Unknown"),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into(),
         };
         let link = match snap.model.link {
             gctl_proto::Link::Wired => "Wired",
@@ -729,50 +715,50 @@ impl Shell {
         let pick_blocked = machine.pick_blocked();
         let profiles = row(Profile::all().into_iter().map(|profile| {
             let is_edited = edit_profile == Some(profile);
-            let style = if is_edited {
-                accent_quiet_button()
-            } else {
-                transparent_button()
-            };
             let id = if is_edited {
                 "edited-profile".to_owned()
             } else {
                 format!("profile-pick-{}", profile.get())
             };
-            let mut pick = button(text(profile.get().to_string())).style(style);
+            let mut pick = button(ui_text(profile.get().to_string()).size(13))
+                .style(theme::quiet_button(scheme))
+                .width(30)
+                .height(30);
+            if is_edited {
+                pick = pick.style(theme::pick_selected(scheme));
+            }
             if pick_blocked.is_none() {
                 pick = pick.on_press(Message::Machine(Msg::PickProfile(profile)));
             }
             container(pick).id(id).into()
         }))
         .spacing(4);
-        let edit_row = row![text("Edit").color(TEXT_3), profiles]
+        let edit_row = row![ui_text("Edit").size(12).color(t.text_3), profiles]
             .spacing(8)
             .align_y(iced::Alignment::Center);
 
-        let make_active: Element<'_, Message> =
-            if edit_profile.is_some() && edit_profile != Some(snap.active) {
-                match machine.make_active_blocked() {
-                    None => button("Make active")
-                        .on_press(Message::Machine(Msg::MakeActive))
-                        .style(accent_button())
-                        .into(),
-                    Some(reason) => column![
-                        button("Make active").style(disabled_button()),
-                        text(reason).color(DANGER_TEXT).size(12),
-                    ]
-                    .spacing(4)
-                    .into(),
-                }
-            } else {
-                Element::from(space())
-            };
-        let active_row = row![
-            text(format!("Active profile: {}", snap.active.get())).color(TEXT_2),
-            make_active,
+        let show_make_active = edit_profile.is_some() && edit_profile != Some(snap.active);
+        let mut active_area = column![
+            ui_text(format!("Active profile: {}", snap.active.get()))
+                .size(12)
+                .color(t.text_2),
         ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
+        .align_x(iced::Alignment::Start);
+        if show_make_active {
+            let blocked = machine.make_active_blocked();
+            let mut b = button(control_label("Make active"))
+                .style(theme::primary_button(scheme))
+                .height(CONTROL_HEIGHT);
+            if blocked.is_none() {
+                b = b.on_press(Message::Machine(Msg::MakeActive));
+            }
+            active_area = active_area.push(b);
+            if let Some(reason) = blocked {
+                active_area =
+                    active_area.push(ui_text(capitalize(&reason)).size(11).color(t.text_3));
+            }
+        }
+        let active_area = active_area.spacing(4);
 
         let sections = column(
             [
@@ -782,127 +768,155 @@ impl Shell {
                 Section::Device,
             ]
             .into_iter()
-            .map(|section| self.section_row(section)),
+            .map(|section| self.section_row(scheme, section)),
         )
         .spacing(2);
 
         let sidebar = column![
             model_row,
-            text(battery).color(TEXT_2),
-            text(link).color(TEXT_3),
+            battery,
+            ui_text(link).size(13).color(t.text_3),
             edit_row,
-            active_row,
-            rule::horizontal(1),
+            active_area,
+            rule::horizontal(1).style(theme::rule(scheme)),
             sections,
         ]
         .spacing(8)
         .padding(12);
         container(sidebar)
             .width(220)
-            .style(surface(SURFACE_1))
+            .style(theme::sidebar(scheme))
             .height(Length::Fill)
             .into()
     }
 
-    fn section_row(&self, section: Section) -> Element<'_, Message> {
+    fn section_row(&self, scheme: Scheme, section: Section) -> Element<'_, Message> {
         let machine = &self.machine;
+        let t = scheme.tokens();
         let current = section == machine.section();
         let label = format!(
             "{}{}",
             section_label(section),
             if machine.pending(section) { " •" } else { "" }
         );
+        let dot = container(space())
+            .width(6)
+            .height(6)
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(if current {
+                    t.accent
+                } else {
+                    Color::TRANSPARENT
+                })),
+                border: Border {
+                    radius: 999.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            });
         let row = row![
-            text(label).color(if current { ACCENT_TEXT } else { TEXT }),
-            space().width(Length::Fill),
+            dot,
+            ui_text(label)
+                .size(13)
+                .color(if current { t.accent_text } else { t.text }),
         ]
-        .padding([6, 10]);
-        let style = if current {
-            accent_quiet_button()
-        } else {
-            transparent_button()
-        };
+        .padding([6, 10])
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
         button(row)
-            .style(style)
+            .style(theme::quiet_button(scheme))
             .on_press(Message::Machine(Msg::Select(section)))
             .width(Length::Fill)
             .into()
     }
 
-    fn content_pane(&self) -> Element<'_, Message> {
+    fn content_pane(&self, scheme: Scheme) -> Element<'_, Message> {
         // A pick empties the panes until a snapshot of the picked profile lands:
         // loading while its read runs, asleep when the read answered asleep.
         if self.machine.live_snapshot().is_none() {
             return match self.machine.connection() {
-                Connection::Asleep => {
-                    empty_state("The mouse is asleep. Move it to wake it.", String::new())
-                }
+                Connection::Asleep => empty_state(
+                    scheme,
+                    "The mouse is asleep. Move it to wake it.",
+                    String::new(),
+                ),
                 Connection::Loading
                 | Connection::NoMouse
                 | Connection::Ready
-                | Connection::Failed => center(text("Loading")).into(),
+                | Connection::Failed => center(ui_text("Loading")).into(),
             };
         }
         let machine = &self.machine;
         let section = machine.section();
         let body = match section {
-            Section::Performance => self.performance_pane(),
-            Section::Lighting => self.lighting_pane(),
-            Section::Buttons => self.buttons_pane(),
-            Section::Device => self.device_pane(),
+            Section::Performance => self.performance_pane(scheme),
+            Section::Lighting => self.lighting_pane(scheme),
+            Section::Buttons => self.buttons_pane(scheme),
+            Section::Device => self.device_pane(scheme),
         };
         if section == Section::Device {
-            return column![scrollable(container(body).padding([12, 16]))].into();
+            return scrollable(container(body).padding([12, 16]))
+                .style(theme::scrollable(scheme))
+                .into();
         }
         let blocked = machine.apply_blocked();
         let nothing_pending = !machine.pending(section);
-        let apply: Element<'_, Message> = match (&blocked, nothing_pending) {
-            (None, false) => button("Apply")
-                .style(accent_button())
-                .on_press(Message::Machine(Msg::Apply))
-                .into(),
-            _ => button("Apply").style(disabled_button()).into(),
+        let apply: Element<'_, Message> = {
+            let mut b = button(control_label("Apply"))
+                .style(theme::filled_button(scheme))
+                .height(CONTROL_HEIGHT);
+            if blocked.is_none() && !nothing_pending {
+                b = b.on_press(Message::Machine(Msg::Apply));
+            }
+            b.into()
         };
-        let revert: Element<'_, Message> = if nothing_pending {
-            button("Revert").style(disabled_button()).into()
-        } else {
-            button("Revert")
-                .style(secondary_button())
-                .on_press(Message::Machine(Msg::Revert))
-                .into()
+        let revert: Element<'_, Message> = {
+            let mut b = button(control_label("Revert"))
+                .style(theme::quiet_button(scheme))
+                .height(CONTROL_HEIGHT);
+            if !nothing_pending {
+                b = b.on_press(Message::Machine(Msg::Revert));
+            }
+            b.into()
         };
         let notice = machine.notice().map(|notice| match notice {
-            Notice::Done(message) => text(message).color(SUCCESS),
-            Notice::Failed(message) => text(message).color(DANGER_TEXT),
+            Notice::Done(message) => ui_text(capitalize(message))
+                .size(13)
+                .color(scheme.tokens().success),
+            Notice::Failed(message) => ui_text(capitalize(message))
+                .size(13)
+                .color(scheme.tokens().danger_text),
         });
-        let reason = blocked.map(|reason| text(reason).color(DANGER_TEXT).size(13));
-        let footer = column![
-            rule::horizontal(1),
-            row![
-                revert,
-                space().width(Length::Fill),
-                match reason {
-                    Some(reason) => reason.into(),
-                    None => Element::from(space()),
-                },
-                apply,
-            ]
+        let reason = blocked.map(|reason| {
+            ui_text(capitalize(&reason))
+                .size(13)
+                .color(scheme.tokens().text_3)
+        });
+        let mut footer_row = row![revert, space().width(Length::Fill)]
             .spacing(12)
-            .align_y(iced::Alignment::Center),
-            match notice {
-                Some(notice) => notice.into(),
-                None => Element::from(space()),
-            },
+            .align_y(iced::Alignment::Center);
+        if let Some(reason) = reason {
+            footer_row = footer_row.push(reason);
+        }
+        footer_row = footer_row.push(apply);
+        let mut footer =
+            column![rule::horizontal(1).style(theme::rule(scheme)), footer_row].spacing(8);
+        if let Some(notice) = notice {
+            footer = footer.push(notice);
+        }
+        let footer = footer.padding([12, 16]);
+        column![
+            scrollable(container(body).padding([12, 16])).style(theme::scrollable(scheme)),
+            footer
         ]
-        .spacing(8)
-        .padding([12, 16]);
-        column![scrollable(container(body).padding([12, 16])), footer].into()
+        .into()
     }
 
     // --- Performance ----------------------------------------------------------
 
-    fn performance_pane(&self) -> Element<'_, Message> {
+    fn performance_pane(&self, scheme: Scheme) -> Element<'_, Message> {
         let machine = &self.machine;
+        let t = scheme.tokens();
         let stage_texts = machine.stage_texts().unwrap_or_default();
         let stage_colors = machine.stage_colors();
 
@@ -920,43 +934,70 @@ impl Shell {
                 } else {
                     hex
                 };
-                let remove: Element<'_, Message> = if stage_texts.len() > 1 {
-                    button("Remove")
-                        .on_press(Message::Machine(Msg::Edit(Edit::RemoveStage(index))))
-                        .style(secondary_button())
-                        .into()
-                } else {
-                    Element::from(space())
-                };
-                row![
-                    text(format!("Stage {}", index + 1)).width(64),
+                let mut control_children: Vec<Element<'_, Message>> = vec![
                     text_input("100-19000", value)
-                        .style(input_style())
-                        .on_input(move |text| Message::Machine(Msg::Edit(Edit::DpiText(
-                            index, text,
-                        ))))
-                        .width(110),
-                    remembered.map(color_swatch).unwrap_or_else(|| {
-                        container(text("Unknown").color(TEXT_4).size(11))
-                            .padding(4)
-                            .into()
-                    }),
+                        .style(theme::text_input(scheme))
+                        .font(MONO_FONT)
+                        .size(14)
+                        .padding([9.0, 12.0])
+                        .on_input(move |text| {
+                            Message::Machine(Msg::Edit(Edit::DpiText(index, text)))
+                        })
+                        .width(110)
+                        .into(),
+                ];
+                if let Some(color) = remembered {
+                    control_children.push(color_swatch(scheme, color));
+                }
+                control_children.push(
                     text_input("hex", &hex_value)
-                        .style(input_style())
+                        .style(theme::text_input(scheme))
+                        .font(if hex_value.is_empty() {
+                            UI_FONT
+                        } else {
+                            MONO_FONT
+                        })
+                        .size(14)
+                        .padding([9.0, 12.0])
                         .on_input(move |text| {
                             Message::Machine(Msg::Edit(Edit::StageColorHex(index, text)))
                         })
-                        .width(80),
-                    remove,
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center)
-                .into()
+                        .width(80)
+                        .into(),
+                );
+                if stage_texts.len() > 1 {
+                    control_children.push(
+                        button(control_label("Remove"))
+                            .on_press(Message::Machine(Msg::Edit(Edit::RemoveStage(index))))
+                            .style(theme::quiet_button(scheme))
+                            .height(CONTROL_HEIGHT)
+                            .into(),
+                    );
+                }
+                let control = row(control_children)
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center);
+                let mut stage_tags = Vec::new();
+                if remembered.is_none() {
+                    stage_tags.push("Unknown");
+                }
+                setting_row(
+                    scheme,
+                    format!("Stage {}", index + 1),
+                    control.into(),
+                    Element::from(space()),
+                    stage_tags,
+                )
             })
             .collect();
 
         let add_stage = if stage_texts.len() < gctl_proto::DpiStages::MAX {
-            Some(button("Add stage").on_press(Message::Machine(Msg::Edit(Edit::AddStage))))
+            Some(
+                button(control_label("Add stage"))
+                    .style(theme::primary_button(scheme))
+                    .height(CONTROL_HEIGHT)
+                    .on_press(Message::Machine(Msg::Edit(Edit::AddStage))),
+            )
         } else {
             None
         };
@@ -967,35 +1008,60 @@ impl Shell {
             |stage| Message::Machine(Msg::Edit(Edit::ActiveStage(stage))),
         )
         .placeholder("active stage")
+        .style(theme::pick_list(scheme))
+        .menu_style(theme::pick_menu(scheme))
+        .text_size(14)
+        .font(MONO_FONT)
+        .padding([9.0, 12.0])
         .into();
 
-        let polling: Element<'_, Message> = container(pick_list(
-            POLLING_OPTIONS.as_slice(),
-            machine.polling_rate().map(polling_label),
-            |label| Message::Machine(Msg::Edit(polling_pick(&label))),
-        ))
+        let polling: Element<'_, Message> = container(
+            pick_list(
+                POLLING_OPTIONS.as_slice(),
+                machine.polling_rate().map(polling_label),
+                |label| Message::Machine(Msg::Edit(polling_pick(&label))),
+            )
+            .style(theme::pick_list(scheme))
+            .menu_style(theme::pick_menu(scheme))
+            .text_size(14)
+            .font(MONO_FONT)
+            .padding([9.0, 12.0]),
+        )
         .id("polling-picker")
         .into();
 
-        let lift_off: Element<'_, Message> = container(pick_list(
-            LIFT_OFF_OPTIONS.as_slice(),
-            machine.lift_off().map(lift_off_label),
-            |label| Message::Machine(Msg::Edit(lift_off_pick(&label))),
-        ))
+        let lift_off: Element<'_, Message> = container(
+            pick_list(
+                LIFT_OFF_OPTIONS.as_slice(),
+                machine.lift_off().map(lift_off_label),
+                |label| Message::Machine(Msg::Edit(lift_off_pick(&label))),
+            )
+            .style(theme::pick_list(scheme))
+            .menu_style(theme::pick_menu(scheme))
+            .text_size(14)
+            .font(MONO_FONT)
+            .padding([9.0, 12.0]),
+        )
         .id("lift-off-picker")
         .into();
 
-        let debounce_row: Element<'_, Message> = row![
-            slider(0..=16, machine.debounce().unwrap_or(0), |ms| {
-                Message::Machine(Msg::Edit(Edit::Debounce(ms)))
-            }),
-            text(format!("{} ms", machine.debounce().unwrap_or(0))).width(48),
-        ]
-        .spacing(8)
+        let debounce = machine.debounce().unwrap_or(0);
+        let debounce_control: Element<'_, Message> = slider(0..=16, debounce, |ms| {
+            Message::Machine(Msg::Edit(Edit::Debounce(ms)))
+        })
+        .style(theme::slider(scheme))
+        .width(Length::Fill)
+        .height(CONTROL_HEIGHT)
         .into();
+        let debounce_readout: Element<'_, Message> =
+            ui_text(format!("{debounce} ms")).font(MONO_FONT).into();
 
         let never = machine.sleep_never().unwrap_or(false);
         let minutes = text_input("minutes", &machine.sleep_minutes().unwrap_or_default())
+            .style(theme::text_input(scheme))
+            .font(MONO_FONT)
+            .size(14)
+            .padding([9.0, 12.0])
             .width(60)
             .id("sleep-minutes");
         let minutes: Element<'_, Message> = if never {
@@ -1006,6 +1072,10 @@ impl Shell {
                 .into()
         };
         let seconds = text_input("seconds", &machine.sleep_seconds().unwrap_or_default())
+            .style(theme::text_input(scheme))
+            .font(MONO_FONT)
+            .size(14)
+            .padding([9.0, 12.0])
             .width(60)
             .id("sleep-seconds");
         let seconds: Element<'_, Message> = if never {
@@ -1016,72 +1086,112 @@ impl Shell {
                 .into()
         };
         let sleep_row: Element<'_, Message> = row![
-            checkbox(never).on_toggle(|never| Message::Machine(Msg::Edit(Edit::SleepNever(never)))),
-            text("Never"),
+            checkbox(never)
+                .style(theme::checkbox(scheme))
+                .on_toggle(|never| Message::Machine(Msg::Edit(Edit::SleepNever(never)))),
+            ui_text("Never").size(14),
             minutes,
-            text("m"),
+            ui_text("m").size(13).color(t.text_3),
             seconds,
-            text("s"),
+            ui_text("s").size(13).color(t.text_3),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center)
         .into();
 
-        let dpi_mark: Element<'_, Message> =
-            match machine.snapshot().and_then(|snap| snap.dpi_colors.as_ref()) {
-                Some(_) => mark_text("set by gctl"),
-                None => Element::from(space()),
-            };
-        let dpi_label_row: Element<'_, Message> = row![
-            text("DPI stages").color(TEXT_2),
-            text("per profile").color(TEXT_4).size(12),
-            dpi_mark,
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center)
-        .into();
+        let remembered_dpi_colors = machine
+            .snapshot()
+            .and_then(|snap| snap.dpi_colors.as_ref())
+            .is_some();
+        let mut dpi_tags = vec!["per profile"];
+        if remembered_dpi_colors {
+            dpi_tags.push("last set by gctl");
+        }
 
-        column![
-            dpi_label_row,
+        let mut dpi_body = column![
+            setting_row(
+                scheme,
+                "DPI stages",
+                Element::from(space()),
+                Element::from(space()),
+                dpi_tags
+            ),
             column(stage_rows).spacing(6),
-            match add_stage {
-                Some(add) => add.into(),
-                None => Element::from(space()),
-            },
-            labeled_row("Active stage", "per profile"),
-            active_stage,
-            labeled_row("Polling rate", "all profiles"),
-            polling,
-            labeled_row("Lift-off", "all profiles"),
-            lift_off,
-            labeled_row("Debounce", "per profile"),
-            debounce_row,
-            labeled_row("Sleep", "all profiles"),
-            sleep_row,
         ]
-        .spacing(10)
-        .into()
+        .spacing(10);
+        if let Some(add) = add_stage {
+            dpi_body = dpi_body.push(setting_row(
+                scheme,
+                "",
+                add.into(),
+                Element::from(space()),
+                Vec::new(),
+            ));
+        }
+        dpi_body = dpi_body.push(setting_row(
+            scheme,
+            "Active stage",
+            active_stage,
+            Element::from(space()),
+            vec!["per profile"],
+        ));
+        let dpi_card = card(scheme, "DPI", dpi_body);
+
+        let sensor_card = card(
+            scheme,
+            "Sensor",
+            column![
+                setting_row(
+                    scheme,
+                    "Polling rate",
+                    polling,
+                    Element::from(space()),
+                    vec!["all profiles"]
+                ),
+                setting_row(
+                    scheme,
+                    "Lift-off",
+                    lift_off,
+                    Element::from(space()),
+                    vec!["all profiles"]
+                ),
+                setting_row(
+                    scheme,
+                    "Debounce",
+                    debounce_control,
+                    debounce_readout,
+                    vec!["per profile"]
+                ),
+                setting_row(
+                    scheme,
+                    "Sleep",
+                    sleep_row,
+                    Element::from(space()),
+                    vec!["all profiles"]
+                ),
+            ]
+            .spacing(10),
+        );
+
+        column![dpi_card, sensor_card].spacing(16).into()
     }
 
     // --- Lighting -------------------------------------------------------------
 
-    fn lighting_pane(&self) -> Element<'_, Message> {
+    fn lighting_pane(&self, scheme: Scheme) -> Element<'_, Message> {
         let machine = &self.machine;
         let kind = machine.effect_kind();
 
         let effect_picker = pick_list(EffectKind::ALL, kind, |kind| {
             Message::Machine(Msg::Edit(Edit::Effect(kind)))
-        });
-        // An unknown effect reads `Unknown` as a text widget, so a selector can
-        // count it, never as an uncountable picker placeholder.
-        let effect_row: Element<'_, Message> = if kind.is_none() {
-            row![effect_picker, mark_text("Unknown")]
-                .spacing(8)
-                .align_y(iced::Alignment::Center)
-                .into()
-        } else {
-            effect_picker.into()
-        };
+        })
+        .style(theme::pick_list(scheme))
+        .menu_style(theme::pick_menu(scheme))
+        .text_size(14)
+        .padding([9.0, 12.0]);
+        // An unknown effect reads `Unknown` as a tag in the tag column, so a
+        // selector can count it, never as an uncountable picker placeholder.
+        let effect_row: Element<'_, Message> = effect_picker.into();
 
         let takes_rate = matches!(
             kind,
@@ -1100,19 +1210,20 @@ impl Shell {
             Some(EffectKind::Pulse | EffectKind::Rave | EffectKind::Solid | EffectKind::PulseOne)
         );
 
-        let rate_row: Element<'_, Message> = if takes_rate {
+        let rate_row: Option<(Element<'_, Message>, Element<'_, Message>)> = if takes_rate {
             let rate = machine.effect_rate().unwrap_or(0);
-            row![
-                text("Speed").width(56),
+            Some((
                 slider(0..=100, rate, |rate| {
                     Message::Machine(Msg::Edit(Edit::Rate(rate)))
-                }),
-                text(format!("{rate}")).width(40),
-            ]
-            .spacing(8)
-            .into()
+                })
+                .style(theme::slider(scheme))
+                .width(Length::Fill)
+                .height(CONTROL_HEIGHT)
+                .into(),
+                ui_text(format!("{rate}")).font(MONO_FONT).into(),
+            ))
         } else {
-            Element::from(space())
+            None
         };
 
         let color_rows: Vec<Element<'_, Message>> = if takes_colors {
@@ -1133,49 +1244,54 @@ impl Shell {
             };
             let mut rows: Vec<Element<'_, Message>> = (0..colors.len())
                 .map(|index| {
-                    let remembered = colors.get(index).copied();
+                    let remembered = colors[index];
                     let hex = machine.effect_color_hex(index);
                     let hex_value = if hex.is_empty() {
-                        remembered.map(parse::format_color).unwrap_or_default()
+                        parse::format_color(remembered)
                     } else {
                         hex
                     };
                     let remove = if colors.len() > min_effect_colors(kind) {
                         Some(
-                            button("Remove")
+                            button(control_label("Remove"))
                                 .on_press(Message::Machine(Msg::Edit(Edit::RemoveEffectColor(
                                     index,
                                 ))))
-                                .style(secondary_button()),
+                                .style(theme::quiet_button(scheme))
+                                .height(CONTROL_HEIGHT),
                         )
                     } else {
                         None
                     };
-                    row![
-                        remembered.map(color_swatch).unwrap_or_else(|| {
-                            container(text("Unknown").color(TEXT_4).size(11))
-                                .padding(4)
-                                .into()
-                        }),
+                    let mut control = row![
+                        color_swatch(scheme, remembered),
                         text_input("hex", &hex_value)
-                            .style(input_style())
+                            .style(theme::text_input(scheme))
+                            .font(if hex_value.is_empty() {
+                                UI_FONT
+                            } else {
+                                MONO_FONT
+                            })
+                            .size(14)
+                            .padding([9.0, 12.0])
                             .on_input(move |text| {
                                 Message::Machine(Msg::Edit(Edit::EffectColorHex(index, text)))
                             })
                             .width(80),
-                        match remove {
-                            Some(remove) => remove.into(),
-                            None => Element::from(space()),
-                        },
                     ]
                     .spacing(8)
-                    .align_y(iced::Alignment::Center)
-                    .into()
+                    .align_y(iced::Alignment::Center);
+                    if let Some(remove) = remove {
+                        control = control.push(remove);
+                    }
+                    control.into()
                 })
                 .collect();
             if colors.len() < max {
                 rows.push(
-                    button("Add colour")
+                    button(control_label("Add colour"))
+                        .style(theme::primary_button(scheme))
+                        .height(CONTROL_HEIGHT)
                         .on_press(Message::Machine(Msg::Edit(Edit::AddEffectColor)))
                         .into(),
                 );
@@ -1185,100 +1301,153 @@ impl Shell {
             Vec::new()
         };
 
-        let wired_row = brightness_row(
+        let (wired_control, wired_readout, wired_unknown) = brightness_row(
+            scheme,
             "wired-slider",
-            "Wired",
             machine.brightness_wired(),
             |value| Message::Machine(Msg::Edit(Edit::BrightnessWired(value))),
             Edit::BrightnessWiredRelease,
         );
-        let wireless_row = brightness_row(
+        let (wireless_control, wireless_readout, wireless_unknown) = brightness_row(
+            scheme,
             "wireless-slider",
-            "Wireless",
             machine.brightness_wireless(),
             |value| Message::Machine(Msg::Edit(Edit::BrightnessWireless(value))),
             Edit::BrightnessWirelessRelease,
         );
 
         let remembered_effect = machine.snapshot().and_then(|snap| snap.effect.as_ref());
-        let effect_mark: Element<'_, Message> = match remembered_effect {
-            Some(_) => mark_text("set by gctl"),
-            None => Element::from(space()),
-        };
         let remembered_brightness = machine.snapshot().and_then(|snap| snap.brightness);
-        let brightness_mark: Element<'_, Message> = match remembered_brightness {
-            Some(_) => mark_text("set by gctl"),
-            None => Element::from(space()),
-        };
 
-        column![
-            labeled_row("Effect", "per profile"),
+        let mut effect_tags = vec!["per profile"];
+        if remembered_effect.is_some() {
+            effect_tags.push("last set by gctl");
+        }
+        if kind.is_none() {
+            effect_tags.push("Unknown");
+        }
+        let mut brightness_tags = vec!["all profiles"];
+        if remembered_brightness.is_some() {
+            brightness_tags.push("last set by gctl");
+        }
+        let mut wired_tags = brightness_tags.clone();
+        if wired_unknown {
+            wired_tags.push("Unknown");
+        }
+        let mut wireless_tags = brightness_tags;
+        if wireless_unknown {
+            wireless_tags.push("Unknown");
+        }
+
+        let mut effect_body = column![setting_row(
+            scheme,
+            "Effect",
             effect_row,
-            rate_row,
-            column(color_rows).spacing(6),
-            effect_mark,
-            labeled_row("Brightness", "all profiles"),
-            wired_row,
-            wireless_row,
-            brightness_mark,
-        ]
-        .spacing(10)
-        .into()
+            Element::from(space()),
+            effect_tags
+        )]
+        .spacing(10);
+        if let Some((rate_control, rate_readout)) = rate_row {
+            effect_body = effect_body.push(setting_row(
+                scheme,
+                "Speed",
+                rate_control,
+                rate_readout,
+                Vec::new(),
+            ));
+        }
+        if takes_colors {
+            effect_body = effect_body.push(setting_row(
+                scheme,
+                "Colours",
+                column(color_rows).spacing(6).into(),
+                Element::from(space()),
+                Vec::new(),
+            ));
+        }
+        let effect_card = card(scheme, "Effect", effect_body);
+
+        let brightness_card = card(
+            scheme,
+            "Brightness",
+            column![
+                setting_row(scheme, "Wired", wired_control, wired_readout, wired_tags),
+                setting_row(
+                    scheme,
+                    "Wireless",
+                    wireless_control,
+                    wireless_readout,
+                    wireless_tags
+                ),
+            ]
+            .spacing(10),
+        );
+
+        column![effect_card, brightness_card].spacing(16).into()
     }
 
     // --- Buttons --------------------------------------------------------------
 
-    fn buttons_pane(&self) -> Element<'_, Message> {
+    fn buttons_pane(&self, scheme: Scheme) -> Element<'_, Message> {
         let machine = &self.machine;
         let rows: Vec<Element<'_, Message>> = crate::get::BUTTONS
             .iter()
-            .map(|button| self.bind_row(*button))
+            .map(|button| self.bind_row(scheme, *button))
             .collect();
 
         let scroll = machine.scroll();
         let remembered_scroll = machine.snapshot().and_then(|snap| snap.scroll);
-        // The `set by gctl` mark comes from the snapshot; the `Unknown` text and
-        // the dimming follow what is shown (the overlay), so a picked direction
-        // drops them even before Apply, like the brightness rows.
-        let scroll_mark: Element<'_, Message> = match remembered_scroll {
-            Some(_) => mark_text("set by gctl"),
-            None if scroll.is_none() => mark_text("Unknown"),
-            None => Element::from(space()),
-        };
+        // The `last set by gctl` and `Unknown` marks sit in the tag column; the
+        // dimming follows what is shown (the overlay), so a picked direction
+        // drops the `Unknown` mark even before Apply, like the brightness rows.
+        let mut scroll_tags = vec!["all profiles"];
+        match remembered_scroll {
+            Some(_) => scroll_tags.push("last set by gctl"),
+            None if scroll.is_none() => scroll_tags.push("Unknown"),
+            None => {}
+        }
         let invert = scroll == Some(gctl_proto::ScrollDirection::Invert);
         let toggler = toggler(invert)
+            .style(theme::toggler(scheme))
             .on_toggle(|invert| Message::Machine(Msg::Edit(Edit::Scroll(scroll_of(invert)))));
         // Unknown draws dimmed, like the unknown brightness sliders, so an OFF
         // toggler never reads as `default`.
         let toggler: Element<'_, Message> = if scroll.is_none() {
-            toggler.style(dim_toggler()).into()
+            toggler.style(theme::dim_toggler(scheme)).into()
         } else {
             toggler.into()
         };
 
-        let scroll_row: Element<'_, Message> = row![toggler, text("Invert scroll"), scroll_mark]
-            .spacing(8)
-            .align_y(iced::Alignment::Center)
-            .into();
+        let scroll_row: Element<'_, Message> = container(
+            row![toggler, ui_text("Invert scroll").size(14)]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+        )
+        .center_y(CONTROL_HEIGHT)
+        .into();
 
-        column![
-            labeled_row("Scroll", "all profiles"),
-            scroll_row,
-            labeled_row("Buttons", "per profile"),
-            column(rows).spacing(8),
-        ]
-        .spacing(10)
-        .into()
+        let scroll_card = card(
+            scheme,
+            "Scroll",
+            setting_row(
+                scheme,
+                "Scroll",
+                scroll_row,
+                Element::from(space()),
+                scroll_tags,
+            ),
+        );
+        let buttons_card = card(scheme, "Buttons", column(rows).spacing(8));
+
+        column![scroll_card, buttons_card].spacing(16).into()
     }
 
-    fn bind_row(&self, button: Button) -> Element<'_, Message> {
+    fn bind_row(&self, scheme: Scheme, button: Button) -> Element<'_, Message> {
         let machine = &self.machine;
+        let t = scheme.tokens();
         let binding = machine.bind(button);
         let label = button_label(button);
-        let remembered_bind = machine
-            .snapshot()
-            .and_then(|snap| snap.binds.iter().find(|(b, _)| *b == button))
-            .and_then(|(_, binding)| *binding);
+        let remembered_bind = machine.snapshot().and_then(|snap| snap.bind(button));
         let category = binding_category(binding);
 
         let category_picker = pick_list(
@@ -1291,220 +1460,371 @@ impl Shell {
                 };
                 Message::Machine(Msg::Edit(edit))
             },
-        );
-        // An unknown bind reads `Unknown` as a text widget, so a selector can
-        // count it, never as an uncountable picker placeholder.
-        let category_cell: Element<'_, Message> = if category.is_none() {
-            row![category_picker, mark_text("Unknown")]
+        )
+        .style(theme::pick_list(scheme))
+        .menu_style(theme::pick_menu(scheme))
+        .text_size(14)
+        .padding([9.0, 12.0]);
+        // An unknown bind reads `Unknown` as a tag in the tag column, so a
+        // selector can count it, never as an uncountable picker placeholder.
+        let category_cell: Element<'_, Message> = category_picker.into();
+
+        let control: Element<'_, Message> = match category {
+            None | Some(parse::BindCategory::None) => row![category_cell]
                 .spacing(8)
                 .align_y(iced::Alignment::Center)
-                .into()
-        } else {
-            category_picker.into()
-        };
-
-        let mut row = row![text(label).width(88), category_cell]
-            .spacing(8)
-            .align_y(iced::Alignment::Center);
-
-        match category {
-            None | Some(parse::BindCategory::None) => {}
-            Some(parse::BindCategory::Mouse) => {
-                row = row.push(fn_picker(
+                .into(),
+            Some(parse::BindCategory::Mouse) => row![
+                category_cell,
+                fn_picker(
+                    scheme,
                     &parse::MOUSE_FN_NAMES,
                     parse::BindCategory::Mouse,
                     binding,
                     button,
-                ));
-            }
-            Some(parse::BindCategory::Media) => {
-                row = row.push(fn_picker(
+                ),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into(),
+            Some(parse::BindCategory::Media) => row![
+                category_cell,
+                fn_picker(
+                    scheme,
                     &parse::MEDIA_FN_NAMES,
                     parse::BindCategory::Media,
                     binding,
                     button,
-                ));
-            }
-            Some(parse::BindCategory::Dpi) => {
-                row = row.push(fn_picker(
+                ),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into(),
+            Some(parse::BindCategory::Dpi) => row![
+                category_cell,
+                fn_picker(
+                    scheme,
                     &parse::DPI_FN_NAMES,
                     parse::BindCategory::Dpi,
                     binding,
                     button,
-                ));
-            }
-            Some(parse::BindCategory::Keyboard) => {
-                row = row.push(fn_picker(
+                ),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into(),
+            Some(parse::BindCategory::Keyboard) => row![
+                category_cell,
+                fn_picker(
+                    scheme,
                     &parse::KEYBOARD_FN_NAMES,
                     parse::BindCategory::Keyboard,
                     binding,
                     button,
-                ));
-            }
+                ),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into(),
             Some(parse::BindCategory::Key) => {
                 // The Key category is only shown for a key bind, so the binding
                 // is always a key here; render the category cell alone if not.
                 let Some(Binding::Key { key, modifiers }) = binding else {
-                    return row.into();
+                    return setting_row(
+                        scheme,
+                        label,
+                        row![category_cell]
+                            .spacing(8)
+                            .align_y(iced::Alignment::Center)
+                            .into(),
+                        Element::from(space()),
+                        Vec::new(),
+                    );
                 };
                 let key_names = key_names();
                 let current_key = Some(key.name());
+                // The modifiers sit on a second line under the pickers, so the
+                // widest (`meta-right`) never wraps and the key picker keeps its
+                // full width.
                 let toggles: Vec<Element<'static, Message>> = parse::MODIFIERS
                     .iter()
                     .copied()
                     .map(|(bit, name)| {
                         let on = modifiers.bits() & bit.bits() != 0;
                         row![
-                            checkbox(on).on_toggle(move |on| {
-                                let mut rebuilt = gctl_proto::Modifiers::NONE;
-                                for (b, n) in parse::MODIFIERS {
-                                    let is_set = if n == name {
-                                        on
-                                    } else {
-                                        modifiers.bits() & b.bits() != 0
-                                    };
-                                    if is_set {
-                                        rebuilt = rebuilt | b;
+                            checkbox(on)
+                                .style(theme::checkbox(scheme))
+                                .on_toggle(move |on| {
+                                    let mut rebuilt = gctl_proto::Modifiers::NONE;
+                                    for (b, n) in parse::MODIFIERS {
+                                        let is_set = if n == name {
+                                            on
+                                        } else {
+                                            modifiers.bits() & b.bits() != 0
+                                        };
+                                        if is_set {
+                                            rebuilt = rebuilt | b;
+                                        }
                                     }
-                                }
-                                Message::Machine(Msg::Edit(key_edit(button, key, rebuilt)))
-                            }),
-                            text(name).color(TEXT_4).size(11),
+                                    Message::Machine(Msg::Edit(key_edit(button, key, rebuilt)))
+                                }),
+                            ui_text(name).size(11).color(t.text_4),
                         ]
                         .spacing(2)
                         .align_y(iced::Alignment::Center)
                         .into()
                     })
                     .collect();
-                row = row
-                    .push(iced::widget::row(toggles).spacing(6))
-                    .push(pick_list(key_names, current_key, move |name| {
-                        let edit = match gctl_proto::Key::from_name(name) {
-                            Ok(key) => key_edit(button, key, modifiers),
-                            Err(_) => Edit::InvalidBind(button),
-                        };
-                        Message::Machine(Msg::Edit(edit))
-                    }));
+                let key_picker = pick_list(key_names, current_key, move |name| {
+                    let edit = match gctl_proto::Key::from_name(name) {
+                        Ok(key) => key_edit(button, key, modifiers),
+                        Err(_) => Edit::InvalidBind(button),
+                    };
+                    Message::Machine(Msg::Edit(edit))
+                })
+                .style(theme::pick_list(scheme))
+                .menu_style(theme::pick_menu(scheme))
+                .text_size(14)
+                .padding([9.0, 12.0])
+                .width(KEY_PICKER_WIDTH);
+                column![
+                    row![category_cell, key_picker]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    iced::widget::row(toggles).spacing(6),
+                ]
+                .spacing(6)
+                .align_x(iced::Alignment::Start)
+                .into()
             }
-        }
+        };
 
+        let mut tags = Vec::new();
         if remembered_bind.is_some() {
-            row = row.push(mark_text("set by gctl"));
+            tags.push("last set by gctl");
         }
-        row.into()
+        if category.is_none() {
+            tags.push("Unknown");
+        }
+        setting_row(scheme, label, control, Element::from(space()), tags)
     }
 
     // --- Device ---------------------------------------------------------------
 
-    fn device_pane(&self) -> Element<'_, Message> {
+    fn device_pane(&self, scheme: Scheme) -> Element<'_, Message> {
         let machine = &self.machine;
-        let Some(snap) = machine.snapshot() else {
-            return text("no device").into();
+        let t = scheme.tokens();
+        let Some(snap) = machine.live_snapshot() else {
+            return center(ui_text("Loading")).into();
         };
         let link = match snap.model.link {
             gctl_proto::Link::Wired => "Wired",
             gctl_proto::Link::Wireless => "Wireless",
         };
         let firmware = snap.firmware.to_string();
-        let battery = snap
-            .battery
-            .percent
-            .map(|percent| format!("{percent}%"))
-            .unwrap_or_else(|| "unknown".to_owned());
-
-        let profile = machine.edit_profile().map(Profile::get).unwrap_or(0);
-        let blocked = machine.apply_blocked();
-        let export_button: Element<'_, Message> = match &blocked {
-            None => button(text(format!("Export profile {profile}")))
-                .on_press(Message::ExportClicked)
+        let battery_control: Element<'_, Message> = match snap.battery.percent {
+            Some(percent) => container(ui_text(format!("{percent}%")).size(14).font(MONO_FONT))
+                .center_y(CONTROL_HEIGHT)
                 .into(),
-            Some(_) => button(text(format!("Export profile {profile}")))
-                .style(disabled_button())
-                .into(),
+            None => Element::from(space()),
         };
-        let import_button: Element<'_, Message> = match &blocked {
-            None => button(text(format!("Import into profile {profile}")))
-                .on_press(Message::ImportClicked)
-                .into(),
-            Some(_) => button(text(format!("Import into profile {profile}")))
-                .style(disabled_button())
-                .into(),
+        let battery_tags = if snap.battery.percent.is_none() {
+            vec!["Unknown"]
+        } else {
+            Vec::new()
+        };
+
+        let profile = snap.profile.get();
+        let blocked = machine.file_blocked();
+        let export_button: Element<'_, Message> = {
+            let mut b = button(file_button_label(format!("Export profile {profile}")))
+                .style(theme::primary_button(scheme))
+                .width(FILE_BUTTON_WIDTH)
+                .height(CONTROL_HEIGHT);
+            if blocked.is_none() {
+                b = b.on_press(Message::ExportClicked);
+            }
+            b.into()
+        };
+        let import_button: Element<'_, Message> = {
+            let mut b = button(file_button_label(format!("Import into profile {profile}")))
+                .style(theme::primary_button(scheme))
+                .width(FILE_BUTTON_WIDTH)
+                .height(CONTROL_HEIGHT);
+            if blocked.is_none() {
+                b = b.on_press(Message::ImportClicked);
+            }
+            b.into()
         };
         let export_row: Element<'_, Message> = row![
             text_input("path.toml", &self.export_path)
-                .style(input_style())
+                .style(theme::text_input(scheme))
+                .size(14)
+                .padding([9.0, 12.0])
                 .on_input(Message::ExportPath)
-                .width(320),
+                .width(Length::Fill),
             export_button,
         ]
         .spacing(8)
+        .align_y(iced::Alignment::Center)
         .into();
         let import_row: Element<'_, Message> = row![
             text_input("path.toml", &self.import_path)
-                .style(input_style())
+                .style(theme::text_input(scheme))
+                .size(14)
+                .padding([9.0, 12.0])
                 .on_input(Message::ImportPath)
-                .width(320),
+                .width(Length::Fill),
             import_button,
         ]
         .spacing(8)
+        .align_y(iced::Alignment::Center)
         .into();
 
         let notice = machine.notice().map(|notice| match notice {
-            Notice::Done(message) => text(message).color(SUCCESS),
-            Notice::Failed(message) => text(message).color(DANGER_TEXT),
+            Notice::Done(message) => ui_text(capitalize(message)).size(13).color(t.success),
+            Notice::Failed(message) => ui_text(capitalize(message)).size(13).color(t.danger_text),
         });
-        let reason = blocked.map(|reason| text(reason).color(DANGER_TEXT).size(13));
+        let reason = blocked.map(|reason| ui_text(capitalize(&reason)).size(13).color(t.text_3));
 
-        column![
-            field("Model", snap.model.name.to_owned()),
-            field("Link", link.to_owned()),
-            field("Firmware", firmware),
-            field("Battery", battery),
-            rule::horizontal(1),
-            text("Export profile").color(TEXT_2),
-            export_row,
-            text("Import profile").color(TEXT_2),
-            import_row,
-            match reason {
-                Some(reason) => reason.into(),
-                None => Element::from(space()),
-            },
-            match notice {
-                Some(notice) => notice.into(),
-                None => Element::from(space()),
-            },
-            text("Set by gctl: gctl remembers this value because the mouse cannot report it.")
-                .color(TEXT_4)
-                .size(13),
+        let mouse_card = card(
+            scheme,
+            "Mouse",
+            column![
+                setting_row(
+                    scheme,
+                    "Model",
+                    container(ui_text(snap.model.name).size(14))
+                        .center_y(CONTROL_HEIGHT)
+                        .into(),
+                    Element::from(space()),
+                    Vec::new()
+                ),
+                setting_row(
+                    scheme,
+                    "Link",
+                    container(ui_text(link).size(14))
+                        .center_y(CONTROL_HEIGHT)
+                        .into(),
+                    Element::from(space()),
+                    Vec::new()
+                ),
+                setting_row(
+                    scheme,
+                    "Firmware",
+                    container(ui_text(firmware).size(14).font(MONO_FONT))
+                        .center_y(CONTROL_HEIGHT)
+                        .into(),
+                    Element::from(space()),
+                    Vec::new()
+                ),
+                setting_row(
+                    scheme,
+                    "Battery",
+                    battery_control,
+                    Element::from(space()),
+                    battery_tags,
+                ),
+            ]
+            .spacing(8),
+        );
+
+        let mut profile_body = column![
+            setting_row(
+                scheme,
+                "Export profile",
+                export_row,
+                Element::from(space()),
+                Vec::new()
+            ),
+            setting_row(
+                scheme,
+                "Import profile",
+                import_row,
+                Element::from(space()),
+                Vec::new()
+            ),
         ]
-        .spacing(8)
-        .into()
+        .spacing(8);
+        // An absent reason or notice takes no space; a present one is a real
+        // line the legend flows under (main_view adds the banner the same way).
+        if let Some(reason) = reason {
+            profile_body = profile_body.push(reason);
+        }
+        if let Some(notice) = notice {
+            profile_body = profile_body.push(notice);
+        }
+        let profile_card = card(
+            scheme,
+            "Profile file",
+            profile_body.push(
+                ui_text(
+                    "Last set by gctl: the mouse cannot report this value, so gctl shows the last one it wrote. Another program or a reset may have changed it since."
+                )
+                .size(13)
+                .color(t.text_4),
+            ),
+        );
+
+        column![mouse_card, profile_card].spacing(16).into()
     }
 }
 
 // --- small view helpers --------------------------------------------------------
 
-fn surface(color: Color) -> impl Fn(&iced::Theme) -> container::Style {
-    move |_theme| container::Style {
-        background: Some(Background::Color(color)),
-        ..container::Style::default()
-    }
+/// The one draw-site helper for state-produced copy: it capitalizes the first
+/// letter of every line, so a banner or notice joining two failures never draws
+/// a later line lowercase. A line that starts with a quote or a digit is left
+/// as it is. The state keeps the CLI's lowercase text.
+fn capitalize(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let Some(first) = line.chars().next() else {
+                return line.to_owned();
+            };
+            if first.is_ascii_digit() || first == '"' {
+                return line.to_owned();
+            }
+            let mut out = first.to_uppercase().collect::<String>();
+            out.push_str(&line[first.len_utf8()..]);
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn accent_fill() -> impl Fn(&iced::Theme) -> container::Style {
-    move |_theme| container::Style {
-        background: Some(Background::Color(ACCENT)),
-        text_color: Some(ON_ACCENT),
-        ..container::Style::default()
-    }
+/// Body text in the UI font.
+fn ui_text<'a>(content: impl iced::widget::text::IntoFragment<'a>) -> iced::widget::Text<'a> {
+    text(content).font(UI_FONT)
 }
 
-fn empty_state(heading: &'static str, hint: String) -> Element<'static, Message> {
-    let mut column = column![text(heading).size(24)]
+/// A control button's label, vertically centred in the shared control height.
+/// Its width stays Shrink, so the button hugs its label.
+fn control_label<'a>(content: impl iced::widget::text::IntoFragment<'a>) -> Element<'a, Message> {
+    container(ui_text(content).size(14))
+        .center_y(Length::Fill)
+        .into()
+}
+
+/// A fixed-width file button's label, centred in both axes. Only safe inside a
+/// button with an explicit width (Export / Import at `FILE_BUTTON_WIDTH`): a
+/// `Fill`-width label inside a Shrink-width button would stretch it to fill
+/// its parent, which is why this is separate from `control_label`.
+fn file_button_label<'a>(
+    content: impl iced::widget::text::IntoFragment<'a>,
+) -> Element<'a, Message> {
+    container(ui_text(content).size(14))
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+}
+
+fn empty_state(scheme: Scheme, heading: &'static str, hint: String) -> Element<'static, Message> {
+    let mut column = column![ui_text(heading).size(24)]
         .spacing(8)
         .align_x(iced::Alignment::Center);
     if !hint.is_empty() {
-        column = column.push(text(hint).color(TEXT_3));
+        column = column.push(ui_text(hint).size(14).color(scheme.tokens().text_3));
     }
     center(column)
         .width(Length::Fill)
@@ -1512,40 +1832,96 @@ fn empty_state(heading: &'static str, hint: String) -> Element<'static, Message>
         .into()
 }
 
-fn card_style() -> impl Fn(&iced::Theme) -> container::Style {
-    move |_theme| container::Style {
-        background: Some(Background::Color(SURFACE_1)),
-        border: Border {
-            radius: 14.0.into(),
-            width: 1.0,
-            color: LINE,
-        },
-        ..container::Style::default()
-    }
+/// One setting card: a title over its rows, surface-1 with a 1px line.
+fn card<'a>(
+    scheme: Scheme,
+    title: &'static str,
+    body: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(column![ui_text(title).size(18), body.into()].spacing(12))
+        .style(theme::card(scheme))
+        .padding(16)
+        .width(Length::Fill)
+        .into()
 }
 
-fn scrim_style() -> impl Fn(&iced::Theme) -> container::Style {
-    move |_theme| container::Style {
-        background: Some(Background::Color(Color::from_rgba8(0x10, 0x11, 0x17, 0.55))),
-        ..container::Style::default()
-    }
+/// The fixed widths of the four setting-grid columns: label, readout and tags
+/// are fixed, the control fills the space between label and readout. The same
+/// widths on every pane, so every label starts at one x, every slider ends at
+/// one x and every tag row ends at the card's right edge (gui.md §Window).
+const LABEL_COLUMN: f32 = 110.0;
+const READOUT_COLUMN: f32 = 56.0;
+const TAG_COLUMN: f32 = 180.0;
+
+/// The bind pickers' shared fixed width, wide enough for the longest name any
+/// of them offers (`profile-cycle-down`, wider than the longest key name
+/// `NumpadSubtract`) in full, so a bind never crushes its picker.
+const KEY_PICKER_WIDTH: f32 = 160.0;
+
+/// The Export and Import buttons share this width, so both path inputs end at
+/// one x.
+const FILE_BUTTON_WIDTH: f32 = 170.0;
+
+/// The one setting-row layout, a grid `label | control | readout | tags`: the
+/// control column fills the space between the fixed label and readout columns,
+/// and the tag column is pinned to the card's right edge. A control narrower
+/// than its column sits at the column's left edge.
+fn setting_row<'a>(
+    scheme: Scheme,
+    label: impl iced::widget::text::IntoFragment<'a>,
+    control: Element<'a, Message>,
+    readout: Element<'a, Message>,
+    tags: Vec<&'static str>,
+) -> Element<'a, Message> {
+    let t = scheme.tokens();
+    let label = container(ui_text(label).size(14).color(t.text_2).width(LABEL_COLUMN))
+        .center_y(CONTROL_HEIGHT);
+    let control = container(control).width(Length::Fill);
+    let readout = container(readout)
+        .width(READOUT_COLUMN)
+        .center_y(CONTROL_HEIGHT);
+    let tags = container(row(tags.into_iter().map(|mark| tag(scheme, mark))).spacing(4))
+        .width(TAG_COLUMN)
+        .align_x(iced::Alignment::End)
+        .center_y(CONTROL_HEIGHT);
+    row![label, control, readout, tags]
+        .width(Length::Fill)
+        .spacing(8)
+        .align_y(iced::Alignment::Start)
+        .into()
 }
 
-fn opaque_modal(content: Element<'static, Message>) -> Element<'static, Message> {
+/// A neutral mark tag: text-3 on a quiet surface tint, pill radius.
+fn tag(scheme: Scheme, mark: &'static str) -> Element<'static, Message> {
+    container(ui_text(mark).size(11))
+        .style(theme::tag(scheme))
+        .padding([2.0, 8.0])
+        .into()
+}
+
+/// A warning-tone tag, for the `Untested` badge.
+fn warning_tag(scheme: Scheme, mark: &'static str) -> Element<'static, Message> {
+    container(ui_text(mark).size(11).color(scheme.tokens().warning))
+        .style(theme::tag_warning(scheme))
+        .padding([2.0, 8.0])
+        .into()
+}
+
+fn opaque_modal(scheme: Scheme, content: Element<'static, Message>) -> Element<'static, Message> {
     let card = container(content)
-        .style(card_style())
+        .style(theme::modal(scheme))
         .padding(24)
         .max_width(480);
     let centered = center(card).width(Length::Fill).height(Length::Fill);
     let scrim = container(space())
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(scrim_style());
+        .style(theme::scrim(scheme));
     let overlay: Element<'static, Message> = stack![scrim, centered].into();
     iced::widget::opaque(overlay)
 }
 
-fn discard_prompt(prompt: Prompt, current: Section) -> Element<'static, Message> {
+fn discard_prompt(scheme: Scheme, prompt: Prompt, current: Section) -> Element<'static, Message> {
     let message = match prompt {
         // Name the section being LEFT: it is the one whose edits are lost.
         Prompt::Discard(Leave::Section(_)) => {
@@ -1557,14 +1933,16 @@ fn discard_prompt(prompt: Prompt, current: Section) -> Element<'static, Message>
         Prompt::Import(_) => String::new(),
     };
     column![
-        text(message).size(20),
+        ui_text(message).size(20),
         row![
-            button("Keep editing")
+            button(control_label("Keep editing"))
                 .on_press(Message::Machine(Msg::KeepEditing))
-                .style(secondary_button()),
-            button("Discard")
+                .style(theme::secondary_button(scheme))
+                .height(CONTROL_HEIGHT),
+            button(control_label("Discard"))
                 .on_press(Message::Machine(Msg::Discard))
-                .style(danger_button()),
+                .style(theme::danger_button(scheme))
+                .height(CONTROL_HEIGHT),
         ]
         .spacing(12),
     ]
@@ -1572,28 +1950,34 @@ fn discard_prompt(prompt: Prompt, current: Section) -> Element<'static, Message>
     .into()
 }
 
-fn import_prompt(prompt: Prompt) -> Element<'static, Message> {
+fn import_prompt(scheme: Scheme, prompt: Prompt) -> Element<'static, Message> {
     let Prompt::Import(check) = prompt else {
         return space().into();
     };
-    let mut column = column![text("Import profile?").size(20)].spacing(12);
+    let t = scheme.tokens();
+    let mut column = column![ui_text("Import profile?").size(20)].spacing(12);
     if let Some(note) = check.note {
-        column = column.push(text(note).color(WARNING));
+        column = column.push(ui_text(capitalize(&note)).size(14).color(t.warning));
     }
     if check.device_wide {
         column = column.push(
-            text("This overwrites device-wide settings (polling rate, lift-off, sleep, brightness, scroll).")
-                .color(TEXT_2),
+            ui_text(
+                "This overwrites device-wide settings (polling rate, lift-off, sleep, brightness, scroll).",
+            )
+            .size(14)
+            .color(t.text_2),
         );
     }
     column = column.push(
         row![
-            button("Cancel")
+            button(control_label("Cancel"))
                 .on_press(Message::Machine(Msg::ImportCancel))
-                .style(secondary_button()),
-            button("Import")
+                .style(theme::secondary_button(scheme))
+                .height(CONTROL_HEIGHT),
+            button(control_label("Import"))
                 .on_press(Message::Machine(Msg::ImportConfirm))
-                .style(accent_button()),
+                .style(theme::primary_button(scheme))
+                .height(CONTROL_HEIGHT),
         ]
         .spacing(12),
     );
@@ -1619,6 +2003,23 @@ const POLLING_RATES: [gctl_proto::PollingRate; 4] = [
 
 /// The lift-off distances the picker offers.
 const LIFT_OFFS: [gctl_proto::LiftOff; 2] = [gctl_proto::LiftOff::Mm1, gctl_proto::LiftOff::Mm2];
+
+/// The polling-rate labels the picker offers, low to high, built through the
+/// parse formatter so the picker cannot drift from the CLI's grammar.
+static POLLING_OPTIONS: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| POLLING_RATES.into_iter().map(polling_label).collect());
+
+/// The lift-off labels the picker offers, built through the parse formatter.
+static LIFT_OFF_OPTIONS: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| LIFT_OFFS.into_iter().map(lift_off_label).collect());
+
+fn polling_label(rate: gctl_proto::PollingRate) -> String {
+    format!("{} Hz", parse::format_polling_rate(rate))
+}
+
+fn lift_off_label(lift_off: gctl_proto::LiftOff) -> String {
+    format!("{} mm", parse::format_lift_off(lift_off))
+}
 
 /// The rate a picker label names, from the same list the picker offers.
 fn polling_rate_of(label: &str) -> Option<gctl_proto::PollingRate> {
@@ -1662,17 +2063,8 @@ fn scroll_of(invert: bool) -> gctl_proto::ScrollDirection {
     }
 }
 
-fn field(label: &'static str, value: String) -> iced::widget::Row<'static, Message> {
-    row![text(label).color(TEXT_3).width(100), text(value),].spacing(8)
-}
-
-fn labeled_row(label: &'static str, mark: &'static str) -> iced::widget::Row<'static, Message> {
-    row![text(label).color(TEXT_2), text(mark).color(TEXT_4).size(12),]
-        .spacing(8)
-        .align_y(iced::Alignment::Center)
-}
-
-fn color_swatch(color: gctl_proto::Rgb) -> Element<'static, Message> {
+fn color_swatch(scheme: Scheme, color: gctl_proto::Rgb) -> Element<'static, Message> {
+    let line = scheme.tokens().line;
     container(space())
         .width(18)
         .height(18)
@@ -1683,7 +2075,7 @@ fn color_swatch(color: gctl_proto::Rgb) -> Element<'static, Message> {
             border: Border {
                 radius: 4.0.into(),
                 width: 1.0,
-                color: LINE,
+                color: line,
             },
             ..container::Style::default()
         })
@@ -1707,20 +2099,8 @@ fn min_effect_colors(kind: Option<EffectKind>) -> usize {
     }
 }
 
-/// The write-only mark: `unknown` or `set by gctl`, as a standalone label.
-fn mark_text(mark: &'static str) -> Element<'static, Message> {
-    text(mark).color(TEXT_4).size(12).into()
-}
-
-/// The `--well` background for input fields.
-fn input_style() -> iced::widget::text_input::StyleFn<'static, iced::Theme> {
-    Box::new(|theme, status| iced::widget::text_input::Style {
-        background: Background::Color(WELL),
-        ..iced::widget::text_input::default(theme, status)
-    })
-}
-
 fn fn_picker(
+    scheme: Scheme,
     names: &'static [&'static str],
     family: parse::BindCategory,
     binding: Option<Binding>,
@@ -1737,6 +2117,11 @@ fn fn_picker(
         let edit = bind_edit(button, &format!("{family_token}:{name}"));
         Message::Machine(Msg::Edit(edit))
     })
+    .style(theme::pick_list(scheme))
+    .menu_style(theme::pick_menu(scheme))
+    .text_size(14)
+    .padding([9.0, 12.0])
+    .width(KEY_PICKER_WIDTH)
     .into()
 }
 
@@ -1790,170 +2175,48 @@ fn key_names() -> Vec<&'static str> {
     gctl_proto::Key::all().map(gctl_proto::Key::name).collect()
 }
 
-fn accent_quiet_button() -> iced::widget::button::StyleFn<'static, iced::Theme> {
-    Box::new(|_theme, status| iced::widget::button::Style {
-        background: Some(Background::Color(match status {
-            iced::widget::button::Status::Pressed => SURFACE_3,
-            iced::widget::button::Status::Hovered => SURFACE_2,
-            _ => ACCENT_QUIET,
-        })),
-        text_color: ACCENT_TEXT,
-        border: Border {
-            radius: 6.0.into(),
-            color: ACCENT_LINE,
-            width: 1.0,
-        },
-        ..iced::widget::button::Style::default()
-    })
-}
-
-fn accent_button() -> iced::widget::button::StyleFn<'static, iced::Theme> {
-    Box::new(|_theme, status| iced::widget::button::Style {
-        background: Some(Background::Color(match status {
-            iced::widget::button::Status::Hovered => ACCENT_HOVER,
-            iced::widget::button::Status::Pressed => ACCENT_PRESS,
-            _ => ACCENT,
-        })),
-        text_color: ON_ACCENT,
-        border: Border {
-            radius: 6.0.into(),
-            ..Border::default()
-        },
-        ..iced::widget::button::Style::default()
-    })
-}
-
-fn danger_button() -> iced::widget::button::StyleFn<'static, iced::Theme> {
-    Box::new(|_theme, _status| iced::widget::button::Style {
-        background: Some(Background::Color(DANGER)),
-        text_color: ON_DANGER,
-        border: Border {
-            radius: 6.0.into(),
-            ..Border::default()
-        },
-        ..iced::widget::button::Style::default()
-    })
-}
-
-/// A quiet secondary button: a surface fill with a hairline, never the primary
-/// accent and never a danger fill.
-fn secondary_button() -> iced::widget::button::StyleFn<'static, iced::Theme> {
-    Box::new(|_theme, status| iced::widget::button::Style {
-        background: Some(Background::Color(match status {
-            iced::widget::button::Status::Pressed => SURFACE_3,
-            iced::widget::button::Status::Hovered => SURFACE_2,
-            _ => SURFACE_1,
-        })),
-        text_color: TEXT,
-        border: Border {
-            radius: 6.0.into(),
-            width: 1.0,
-            color: LINE,
-        },
-        ..iced::widget::button::Style::default()
-    })
-}
-
-/// A dimmed slider, for a write-only value with nothing remembered yet.
-fn dim_slider() -> iced::widget::slider::StyleFn<'static, iced::Theme> {
-    Box::new(|theme, status| {
-        let mut style = iced::widget::slider::default(theme, status);
-        style.handle.background = Background::Color(SURFACE_2);
-        style.rail.backgrounds = (Background::Color(SURFACE_2), Background::Color(SURFACE_2));
-        style
-    })
-}
-
-/// A dimmed toggler, for the scroll direction while it is unknown.
-fn dim_toggler() -> iced::widget::toggler::StyleFn<'static, iced::Theme> {
-    Box::new(|theme, status| {
-        let mut style = iced::widget::toggler::default(theme, status);
-        style.background = Background::Color(SURFACE_2);
-        style.foreground = Background::Color(SURFACE_3);
-        style
-    })
-}
-
-/// The polling-rate labels the picker offers, low to high, built through the
-/// parse formatter so the picker cannot drift from the CLI's grammar.
-static POLLING_OPTIONS: std::sync::LazyLock<Vec<String>> =
-    std::sync::LazyLock::new(|| POLLING_RATES.into_iter().map(polling_label).collect());
-
-/// The lift-off labels the picker offers, built through the parse formatter.
-static LIFT_OFF_OPTIONS: std::sync::LazyLock<Vec<String>> =
-    std::sync::LazyLock::new(|| LIFT_OFFS.into_iter().map(lift_off_label).collect());
-
-fn polling_label(rate: gctl_proto::PollingRate) -> String {
-    format!("{} Hz", parse::format_polling_rate(rate))
-}
-
-fn lift_off_label(lift_off: gctl_proto::LiftOff) -> String {
-    format!("{} mm", parse::format_lift_off(lift_off))
-}
-
-/// One brightness row: a dimmed slider with its handle at 0 and `Unknown` until
-/// the link is known, then a live slider and the number. The unknown slider
-/// sends `release` on release, so a click at 0 can set the link to 0 while a
-/// click that picked a value keeps it. The slider carries `id`, so a test can
-/// find its bounds by layout id rather than by the label.
+/// One brightness row's grid cells: a dimmed slider with its handle at 0 and
+/// `Unknown` in the tag column until the link is known, then a live slider and
+/// the number readout. The unknown slider sends `release` on release, so a
+/// click at 0 can set the link to 0 while a click that picked a value keeps it.
+/// The slider carries `id`, so a test can find its bounds by layout id rather
+/// than by the label.
 fn brightness_row(
+    scheme: Scheme,
     id: &'static str,
-    label: &'static str,
     value: Option<u8>,
     on_change: impl Fn(u8) -> Message + 'static,
     release: Edit,
-) -> Element<'static, Message> {
+) -> (Element<'static, Message>, Element<'static, Message>, bool) {
     match value {
         Some(value) => {
-            let slider = container(slider(0..=255, value, on_change).width(Length::Fill))
-                .width(Length::Fill)
-                .id(id);
-            row![
-                text(label).width(56),
-                slider,
-                text(format!("{value}")).width(64)
-            ]
-            .spacing(8)
-            .into()
+            let slider = container(
+                slider(0..=255, value, on_change)
+                    .width(Length::Fill)
+                    .height(CONTROL_HEIGHT)
+                    .style(theme::slider(scheme)),
+            )
+            .width(Length::Fill)
+            .id(id);
+            (
+                slider.into(),
+                ui_text(format!("{value}")).font(MONO_FONT).into(),
+                false,
+            )
         }
         None => {
             let slider = container(
                 slider(0..=255, 0, on_change)
                     .width(Length::Fill)
-                    .style(dim_slider())
+                    .height(CONTROL_HEIGHT)
+                    .style(theme::dim_slider(scheme))
                     .on_release(Message::Machine(Msg::Edit(release))),
             )
             .width(Length::Fill)
             .id(id);
-            row![
-                text(label).width(56),
-                slider,
-                text("Unknown").width(Length::Shrink)
-            ]
-            .spacing(8)
-            .into()
+            (slider.into(), Element::from(space()), true)
         }
     }
-}
-
-fn disabled_button() -> iced::widget::button::StyleFn<'static, iced::Theme> {
-    Box::new(|_theme, _status| iced::widget::button::Style {
-        background: Some(Background::Color(SURFACE_2)),
-        text_color: TEXT_4,
-        border: Border {
-            radius: 6.0.into(),
-            ..Border::default()
-        },
-        ..iced::widget::button::Style::default()
-    })
-}
-
-fn transparent_button() -> iced::widget::button::StyleFn<'static, iced::Theme> {
-    Box::new(|_theme, _status| iced::widget::button::Style {
-        background: None,
-        text_color: TEXT,
-        ..iced::widget::button::Style::default()
-    })
 }
 
 #[cfg(test)]

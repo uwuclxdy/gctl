@@ -14,12 +14,17 @@ use gctl_proto::{
 };
 
 use super::*;
-use crate::gui::state::{Edit, Msg, Section, Snapshot, State};
+use crate::gui::state::{Edit, Msg, Notice, Section, Snapshot, State};
+use crate::gui::theme::Scheme;
+
+#[path = "gui_layout.rs"]
+mod layout;
 
 /// The one entry to the iced_test simulator, guarded so a run from outside the
 /// repo root — where cargo does not read `.cargo/config.toml`'s `[env]` —
 /// fails loudly instead of silently rendering through wgpu and writing the
-/// real `$HOME`'s shader caches.
+/// real `$HOME`'s shader caches. The guard cannot stop a test from calling
+/// `iced_test::simulator` directly; that residual is caught in review.
 fn simulator<'a>(
     view: Element<'a, Message>,
 ) -> iced_test::Simulator<'a, Message, iced::Theme, iced::Renderer> {
@@ -95,6 +100,7 @@ fn shell_with_machine(machine: State) -> Shell {
         lock_path: None,
         export_path: String::new(),
         import_path: String::new(),
+        scheme: Scheme::Dark,
     }
 }
 
@@ -164,9 +170,11 @@ fn render_frame(shell: &Shell, name: &str) {
     let Ok(dir) = std::env::var("GCTL_RENDER_DIR") else {
         return;
     };
-    let mut ui = simulator(shell.view());
-    if let Ok(snapshot) = ui.snapshot(&theme()) {
-        let _ = snapshot.matches_image(Path::new(&dir).join(name));
+    for (scheme, suffix) in [(Scheme::Dark, "dark"), (Scheme::Light, "light")] {
+        let mut ui = simulator(shell.render(scheme));
+        if let Ok(snapshot) = ui.snapshot(&scheme.theme()) {
+            let _ = snapshot.matches_image(Path::new(&dir).join(format!("{name}-{suffix}")));
+        }
     }
 }
 
@@ -190,14 +198,14 @@ fn lighting_shows_unknown_when_nothing_is_remembered() {
     let shell = on_section(snapshot(), Section::Lighting);
     render_frame(&shell, "lighting");
     assert_eq!(count(&shell, "Unknown"), 3);
-    assert!(lacks(&shell, "set by gctl"));
+    assert!(lacks(&shell, "last set by gctl"));
 }
 
 #[test]
 fn buttons_show_unknown_for_every_button() {
     let shell = on_section(snapshot(), Section::Buttons);
     render_frame(&shell, "buttons");
-    assert!(lacks(&shell, "set by gctl"));
+    assert!(lacks(&shell, "last set by gctl"));
     assert_eq!(count(&shell, "Unknown"), 9);
     assert!(contains(&shell, "Invert scroll"));
     assert!(contains(&shell, "Wheel click"));
@@ -240,7 +248,8 @@ fn lighting_marks_a_remembered_effect_and_its_brightness() {
     });
     let shell = on_section(snap, Section::Lighting);
     render_frame(&shell, "lighting-remembered");
-    assert_eq!(count(&shell, "set by gctl"), 2);
+    // effect marks its Effect row; brightness marks both of its rows
+    assert_eq!(count(&shell, "last set by gctl"), 3);
 }
 
 #[test]
@@ -250,7 +259,7 @@ fn lighting_marks_a_remembered_effect_alone() {
         rate: Rate::new(40).unwrap(),
     });
     let shell = on_section(snap, Section::Lighting);
-    assert_eq!(count(&shell, "set by gctl"), 1);
+    assert_eq!(count(&shell, "last set by gctl"), 1);
 }
 
 #[test]
@@ -261,7 +270,7 @@ fn lighting_marks_a_remembered_brightness_alone() {
         wireless: 50,
     });
     let shell = on_section(snap, Section::Lighting);
-    assert_eq!(count(&shell, "set by gctl"), 1);
+    assert_eq!(count(&shell, "last set by gctl"), 2);
 }
 
 #[test]
@@ -272,7 +281,48 @@ fn buttons_mark_every_remembered_bind() {
     }
     let shell = on_section(snap, Section::Buttons);
     render_frame(&shell, "buttons-all-remembered");
-    assert_eq!(count(&shell, "set by gctl"), 8);
+    assert_eq!(count(&shell, "last set by gctl"), 8);
+}
+
+#[test]
+fn buttons_render_key_binds_on_two_lines() {
+    let mut snap = snapshot();
+    for (index, (button, text)) in BUTTONS
+        .iter()
+        .zip([
+            "key:ctrl+KeyA",
+            "key:ctrl+shift+KeyB",
+            "key:meta-right+KeyC",
+            "key:ctrl+shift+alt+meta+F12",
+            "key:NumpadSubtract",
+            "mouse:forward",
+            "media:volume-up",
+            "dpi:stage-up",
+        ])
+        .enumerate()
+    {
+        snap.binds[index] = (*button, Some(crate::parse::binding(text).unwrap()));
+    }
+    let shell = on_section(snap, Section::Buttons);
+    render_frame(&shell, "buttons-key-binds");
+    // The key bind rows carry their modifier labels on a second line, so the
+    // widest (`meta-right`) stays on one line.
+    assert!(contains(&shell, "meta-right"));
+    assert!(contains(&shell, "shift"));
+}
+
+#[test]
+fn lighting_renders_the_pulse_colour_rows() {
+    let mut snap = snapshot();
+    snap.effect = Some(Effect::Pulse {
+        rate: Rate::new(40).unwrap(),
+        colors: ["ff0000", "00ff00", "0000ff", "ffff00", "00ffff", "ff00ff"]
+            .into_iter()
+            .map(rgb)
+            .collect(),
+    });
+    let shell = on_section(snap, Section::Lighting);
+    render_frame(&shell, "lighting-pulse-colours");
 }
 
 #[test]
@@ -281,7 +331,7 @@ fn performance_marks_remembered_stage_colours() {
     snap.dpi_colors = Some(vec![rgb("ff0000"), rgb("00ff00"), rgb("0000ff")]);
     let shell = shell(snap);
     render_frame(&shell, "performance-remembered-colours");
-    assert_eq!(count(&shell, "set by gctl"), 1);
+    assert_eq!(count(&shell, "last set by gctl"), 1);
 }
 
 #[test]
@@ -307,6 +357,7 @@ fn every_offered_bind_token_round_trips() {
 
 #[test]
 fn memory_unreadable_shows_device_rows_and_the_banner() {
+    // The CLI's own text, lowercase; the banner capitalizes at the draw site.
     let refusal = "cannot read remembered values from \"/home/c/.local/state/gctl/memory.toml\": unknown effect \"rainbow\"; fix or delete the file";
     let mut snap = snapshot();
     snap.memory_error = Some(refusal.to_owned());
@@ -315,9 +366,12 @@ fn memory_unreadable_shows_device_rows_and_the_banner() {
     assert!(contains(&shell, "Model O Wireless"));
     assert!(contains(&shell, "10 ms"));
     assert!(contains(&shell, "400"));
-    assert!(contains(&shell, refusal));
+    assert!(contains(
+        &shell,
+        "Cannot read remembered values from \"/home/c/.local/state/gctl/memory.toml\": unknown effect \"rainbow\"; fix or delete the file"
+    ));
     assert!(contains(&shell, "Unknown"));
-    assert!(lacks(&shell, "set by gctl"));
+    assert!(lacks(&shell, "last set by gctl"));
 }
 
 // --- the empty states ----------------------------------------------------------
@@ -373,7 +427,10 @@ fn import_modal_shows_the_note_and_the_device_wide_line() {
     })));
     render_frame(&shell, "import-modal");
     assert!(contains(&shell, "Import profile?"));
-    assert!(contains(&shell, &note));
+    assert!(contains(
+        &shell,
+        "Note: \"/other.toml\" holds settings for \"Model D Wireless\"; writing them to Model O Wireless"
+    ));
     assert!(contains(
         &shell,
         "This overwrites device-wide settings (polling rate, lift-off, sleep, brightness, scroll)."
@@ -813,7 +870,7 @@ fn a_pick_waiting_on_its_read_shows_the_picked_profile_and_loading_panes() {
     assert!(contains_id(&shell, "profile-pick-2"));
     // Make active is disabled with its reason
     assert!(contains(&shell, "Make active"));
-    assert!(contains(&shell, "reading the mouse"));
+    assert!(contains(&shell, "Reading the mouse"));
 }
 
 #[test]
@@ -830,7 +887,10 @@ fn a_pick_answered_asleep_shows_the_asleep_state_in_the_panes() {
     assert!(contains_id(&shell, "profile-pick-2"));
     // Make active is disabled with the asleep reason
     assert!(contains(&shell, "Make active"));
-    assert!(contains(&shell, "the mouse is asleep; wake it to apply"));
+    assert!(contains(
+        &shell,
+        "The mouse is asleep; wake it to change the active profile"
+    ));
 }
 
 #[test]
@@ -889,5 +949,151 @@ fn a_discard_prompt_names_the_question_in_the_footer() {
     machine.update(Msg::Edit(Edit::Debounce(0)));
     machine.update(Msg::Select(Section::Lighting));
     let shell = shell_with_machine(machine);
-    assert!(contains(&shell, "answering a question"));
+    assert!(contains(&shell, "Answering a question"));
+}
+
+// --- capitalize-on-render and theme following -----------------------------------
+
+/// The state keeps the CLI's lowercase text; the draw-site helper capitalizes
+/// the first letter only.
+#[test]
+fn capitalize_capitalizes_the_first_letter_only() {
+    assert_eq!(
+        capitalize("exported to \"/home/c/p.toml\""),
+        "Exported to \"/home/c/p.toml\""
+    );
+    assert_eq!(
+        capitalize("the mouse is asleep; wake it to apply"),
+        "The mouse is asleep; wake it to apply"
+    );
+}
+
+/// A string that starts with a quote or a digit is drawn as it is.
+#[test]
+fn capitalize_leaves_quotes_and_digits_alone() {
+    assert_eq!(capitalize("\"/x/p.toml\" exists"), "\"/x/p.toml\" exists");
+    assert_eq!(capitalize("404 not found"), "404 not found");
+}
+
+/// A drawn notice starts with a capital while the state notice stays lowercase.
+#[test]
+fn a_drawn_notice_starts_with_a_capital() {
+    let mut shell = on_section(snapshot(), Section::Device);
+    shell
+        .machine
+        .update(Msg::Export(std::path::PathBuf::from("/home/c/p.toml")));
+    shell
+        .machine
+        .update(Msg::Exported(Ok(std::path::PathBuf::from(
+            "/home/c/p.toml",
+        ))));
+    assert_eq!(
+        shell.machine.notice(),
+        Some(&Notice::Done("exported to \"/home/c/p.toml\"".to_owned()))
+    );
+    assert!(contains(&shell, "Exported to \"/home/c/p.toml\""));
+}
+
+fn hex(color: iced::Color) -> String {
+    let [r, g, b, _] = color.into_rgba8();
+    format!("#{r:02X}{g:02X}{b:02X}")
+}
+
+/// A light desktop mode drives the shell's scheme, which `run`'s theme hook
+/// reads through `Shell::theme`.
+#[test]
+fn a_light_mode_switches_the_shells_theme() {
+    let mut shell = shell(snapshot());
+    assert_eq!(
+        hex(iced::Theme::palette(&shell.theme()).background),
+        hex(Scheme::Dark.tokens().bg)
+    );
+    let _ = shell.update(Message::Theme(iced::theme::Mode::Light));
+    assert_eq!(
+        hex(iced::Theme::palette(&shell.theme()).background),
+        hex(Scheme::Light.tokens().bg)
+    );
+}
+
+/// A banner joining two failures capitalizes every line, never just the first.
+#[test]
+fn a_banner_joining_two_failures_capitalizes_every_line() {
+    let mut snap = snapshot();
+    snap.memory_error = Some(
+        "cannot read remembered values from \"/m.toml\": bad; fix or delete the file".to_owned(),
+    );
+    let mut shell = shell(snap);
+    shell
+        .machine
+        .update(Msg::Loaded(Err(crate::gui::state::LoadError::Failed(
+            "hid read failed".to_owned(),
+        ))));
+    assert!(contains(
+        &shell,
+        "Hid read failed\nCannot read remembered values from \"/m.toml\": bad; fix or delete the file"
+    ));
+}
+
+/// The import prompt's model note is capitalized at the draw site.
+#[test]
+fn an_import_note_starts_with_a_capital() {
+    let mut shell = shell(snapshot());
+    let note = "note: \"/other.toml\" holds settings for \"Model D Wireless\"; writing them to Model O Wireless".to_owned();
+    shell
+        .machine
+        .update(Msg::Import(std::path::PathBuf::from("/other.toml")));
+    shell
+        .machine
+        .update(Msg::ImportChecked(Ok(crate::gui::state::ImportCheck {
+            note: Some(note.clone()),
+            device_wide: true,
+            writes: Vec::new(),
+        })));
+    assert!(contains(
+        &shell,
+        "Note: \"/other.toml\" holds settings for \"Model D Wireless\"; writing them to Model O Wireless"
+    ));
+}
+
+/// A two-line failed notice capitalizes every line, so the second failure is
+/// never drawn lowercase.
+#[test]
+fn a_two_line_failed_notice_capitalizes_every_line() {
+    let mut shell = on_section(snapshot(), Section::Device);
+    shell
+        .machine
+        .update(Msg::Export(std::path::PathBuf::from("/x/p.toml")));
+    shell.machine.update(Msg::Exported(Err(
+        "write failed\ncannot save remembered values".to_owned(),
+    )));
+    assert!(contains(
+        &shell,
+        "Write failed\nCannot save remembered values"
+    ));
+}
+
+/// The sidebar's battery with no reading is an `Unknown` tag, not prose.
+#[test]
+fn the_sidebar_battery_with_no_reading_is_an_unknown_tag() {
+    let mut snap = snapshot();
+    snap.battery.percent = None;
+    let shell = shell(snap);
+    assert!(contains(&shell, "Battery"));
+    assert!(lacks(&shell, "Battery unknown"));
+}
+
+/// The Device pane reads `file_blocked`, so an asleep mouse greys export and
+/// import and names its own reason.
+#[test]
+fn a_sleep_device_pane_blocks_export_and_import() {
+    let mut machine = State::new().0;
+    machine.update(Msg::Loaded(Ok(snapshot())));
+    machine.update(Msg::Select(Section::Device));
+    machine.update(Msg::Loaded(Err(crate::gui::state::LoadError::Asleep)));
+    let shell = shell_with_machine(machine);
+    render_frame(&shell, "device-asleep");
+    assert!(contains(
+        &shell,
+        "The mouse is asleep; wake it to export or import"
+    ));
 }

@@ -1,0 +1,605 @@
+//! The setting grid, measured: every pane lays its rows out as
+//! label | control | readout | tags, with the tags pinned to the card's right
+//! edge. Positions come from the widget bounds the simulator reports, so a
+//! drifting column fails here instead of in a render.
+
+use iced::Rectangle;
+
+use super::*;
+
+const TAGS: [&str; 4] = ["all profiles", "per profile", "last set by gctl", "Unknown"];
+
+/// Everything left of this x is the sidebar, which is not part of the grid.
+const PANE_LEFT: f32 = 230.0;
+
+/// Positions agree when they differ by less than this many logical pixels.
+const SLACK: f32 = 1.0;
+
+#[derive(Debug, Clone)]
+struct Placed {
+    content: String,
+    bounds: Rectangle,
+}
+
+fn texts(shell: &Shell) -> Vec<Placed> {
+    let mut ui = simulator(shell.view());
+    let mut found = Vec::new();
+    let _ = ui.find(|candidate: iced_test::selector::Candidate<'_>| {
+        if let iced_test::selector::Candidate::Text {
+            content, bounds, ..
+        } = candidate
+            && bounds.x >= PANE_LEFT
+        {
+            found.push(Placed {
+                content: content.to_owned(),
+                bounds,
+            });
+        }
+        None::<()>
+    });
+    found
+}
+
+fn inputs(shell: &Shell) -> Vec<Rectangle> {
+    let mut ui = simulator(shell.view());
+    let mut found = Vec::new();
+    let _ = ui.find(|candidate: iced_test::selector::Candidate<'_>| {
+        if let iced_test::selector::Candidate::TextInput { bounds, .. } = candidate
+            && bounds.x >= PANE_LEFT
+        {
+            found.push(bounds);
+        }
+        None::<()>
+    });
+    found
+}
+
+fn centre_y(bounds: &Rectangle) -> f32 {
+    bounds.y + bounds.height / 2.0
+}
+
+/// The tags grouped by row (centres within 6 px), each row's rightmost edge.
+fn tag_row_ends(placed: &[Placed]) -> Vec<(f32, f32)> {
+    let mut rows: Vec<(f32, f32)> = Vec::new();
+    for tag in placed.iter().filter(|p| TAGS.contains(&p.content.as_str())) {
+        let y = centre_y(&tag.bounds);
+        let right = tag.bounds.x + tag.bounds.width;
+        match rows.iter_mut().find(|(row_y, _)| (row_y - y).abs() < 6.0) {
+            Some((_, end)) => *end = end.max(right),
+            None => rows.push((y, right)),
+        }
+    }
+    rows
+}
+
+fn all_agree(name: &str, values: &[(String, f32)]) {
+    let Some((first_name, first)) = values.first() else {
+        panic!("{name}: nothing measured");
+    };
+    for (what, value) in values {
+        assert!(
+            (value - first).abs() < SLACK,
+            "{name}: {what} at {value}, {first_name} at {first}"
+        );
+    }
+}
+
+/// A snapshot where every write-only value is remembered, so every mark a row
+/// can carry is on screen.
+fn remembered() -> Snapshot {
+    let mut snap = snapshot();
+    snap.effect = Some(Effect::Wave {
+        rate: Rate::new(40).unwrap(),
+    });
+    snap.brightness = Some(gctl_proto::Brightness {
+        wired: 200,
+        wireless: 50,
+    });
+    snap.dpi_colors = Some(vec![rgb("ff0000"), rgb("00ff00"), rgb("0000ff")]);
+    for (index, button) in BUTTONS.iter().enumerate() {
+        snap.binds[index] = (*button, Some(Binding::Mouse(MouseFn::Forward)));
+    }
+    snap
+}
+
+/// The widest rows the panes can show: key binds carrying modifiers (the
+/// longest modifier, `meta-right`, included) and a six-colour pulse.
+fn widest() -> Snapshot {
+    let mut snap = remembered();
+    snap.effect = Some(Effect::Pulse {
+        rate: Rate::new(40).unwrap(),
+        colors: ["ff0000", "00ff00", "0000ff", "ffff00", "00ffff", "ff00ff"]
+            .into_iter()
+            .map(rgb)
+            .collect(),
+    });
+    for (index, (button, text)) in BUTTONS
+        .iter()
+        .zip([
+            "key:ctrl+KeyA",
+            "key:ctrl+shift+KeyB",
+            "key:meta-right+KeyC",
+            "key:ctrl+shift+alt+meta+F12",
+            "key:KeyE",
+            "mouse:forward",
+            "media:volume-up",
+            "dpi:stage-up",
+        ])
+        .enumerate()
+    {
+        snap.binds[index] = (*button, Some(crate::parse::binding(text).unwrap()));
+    }
+    snap
+}
+
+const SECTIONS: [Section; 4] = [
+    Section::Performance,
+    Section::Lighting,
+    Section::Buttons,
+    Section::Device,
+];
+
+/// Every pane: nothing remembered, everything remembered, and the widest rows.
+fn panes() -> Vec<(String, Section, Shell)> {
+    let mut panes = Vec::new();
+    for (state, snap) in [
+        ("empty", snapshot()),
+        ("remembered", remembered()),
+        ("widest", widest()),
+    ] {
+        for section in SECTIONS {
+            panes.push((
+                format!("{section:?} {state}"),
+                section,
+                on_section(snap.clone(), section),
+            ));
+        }
+    }
+    panes
+}
+
+/// Row labels only some states show: the effect's speed and colour list.
+const OPTIONAL_LABELS: [&str; 2] = ["Speed", "Colours"];
+
+/// The row labels each pane shows in every state. A card title shares the
+/// label column, so `Effect` and `Scroll` match their title and their row.
+fn labels(section: Section) -> &'static [&'static str] {
+    match section {
+        Section::Performance => &[
+            "DPI stages",
+            "Stage 1",
+            "Stage 2",
+            "Stage 3",
+            "Active stage",
+            "Polling rate",
+            "Lift-off",
+            "Debounce",
+            "Sleep",
+        ],
+        Section::Lighting => &["Effect", "Wired", "Wireless"],
+        Section::Buttons => &[
+            "Scroll",
+            "Left",
+            "Right",
+            "Wheel click",
+            "Back",
+            "Forward",
+            "Scroll up",
+            "Scroll down",
+            "DPI button",
+        ],
+        Section::Device => &[
+            "Model",
+            "Link",
+            "Firmware",
+            "Battery",
+            "Export profile",
+            "Import profile",
+        ],
+    }
+}
+
+#[test]
+fn every_row_label_starts_in_one_column_on_every_pane() {
+    let mut lefts = Vec::new();
+    for (pane, section, shell) in panes() {
+        let placed = texts(&shell);
+        for label in labels(section) {
+            let found: Vec<&Placed> = placed.iter().filter(|p| p.content == *label).collect();
+            assert!(!found.is_empty(), "{pane}: no {label:?} label");
+            for p in found {
+                lefts.push((format!("{pane} {label:?}"), p.bounds.x));
+            }
+        }
+        // rows only some effects show
+        for p in placed
+            .iter()
+            .filter(|p| OPTIONAL_LABELS.contains(&p.content.as_str()))
+        {
+            lefts.push((format!("{pane} {:?}", p.content), p.bounds.x));
+        }
+    }
+    // the pulse effect's colour list is a row of its own
+    let pulse = on_section(widest(), Section::Lighting);
+    let Some(colours) = texts(&pulse)
+        .into_iter()
+        .find(|placed| placed.content == "Colours")
+    else {
+        panic!("Lighting widest: no \"Colours\" label");
+    };
+    lefts.push(("Lighting widest \"Colours\"".to_owned(), colours.bounds.x));
+    all_agree("label column", &lefts);
+}
+
+fn is_row_label(section: Section, content: &str) -> bool {
+    labels(section).contains(&content) || OPTIONAL_LABELS.contains(&content)
+}
+
+/// The texts sharing a labelled row: centres within 6 px of the label's.
+fn row_of<'a>(placed: &'a [Placed], label: &Placed) -> Vec<&'a Placed> {
+    let y = centre_y(&label.bounds);
+    let mut row: Vec<&Placed> = placed
+        .iter()
+        .filter(|p| (centre_y(&p.bounds) - y).abs() < 6.0)
+        .collect();
+    row.sort_by(|a, b| a.bounds.x.total_cmp(&b.bounds.x));
+    row
+}
+
+#[test]
+fn no_short_text_on_a_pane_wraps() {
+    let measured: Vec<(String, Vec<Placed>)> = panes()
+        .into_iter()
+        .map(|(pane, _, shell)| (pane, texts(&shell)))
+        .collect();
+    // one line of a tag (the smallest text size) sets the bar: a wrapped text
+    // is at least two such lines tall, while a card title (the largest
+    // single-line text) stays under 1.8 of them. every short text counts,
+    // wherever its row puts it (a key bind's modifier line included); the
+    // legend and notices are long sentences that may wrap.
+    let line = measured
+        .iter()
+        .flat_map(|(_, placed)| placed)
+        .filter(|p| TAGS.contains(&p.content.as_str()))
+        .map(|p| p.bounds.height)
+        .fold(f32::INFINITY, f32::min);
+    assert!(line.is_finite(), "no tag to measure a line by");
+    for (pane, placed) in &measured {
+        for text in placed.iter().filter(|p| p.content.chars().count() <= 32) {
+            assert!(
+                text.bounds.height < line * 1.8,
+                "{pane}: {:?} is {} tall, one line is {line}",
+                text.content,
+                text.bounds.height
+            );
+        }
+    }
+}
+
+#[test]
+fn no_two_texts_in_a_setting_row_overlap() {
+    for (pane, section, shell) in panes() {
+        let placed = texts(&shell);
+        for label in placed.iter().filter(|p| is_row_label(section, &p.content)) {
+            let row = row_of(&placed, label);
+            for pair in row.windows(2) {
+                let (left, right) = (pair[0], pair[1]);
+                assert!(
+                    left.bounds.x + left.bounds.width <= right.bounds.x + 0.5,
+                    "{pane}: {:?} runs into {:?} on the {:?} row",
+                    left.content,
+                    right.content,
+                    label.content
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_tag_row_ends_at_the_cards_right_edge_on_every_pane() {
+    let mut ends = Vec::new();
+    for (pane, _, shell) in panes() {
+        for (y, end) in tag_row_ends(&texts(&shell)) {
+            ends.push((format!("{pane} row at y {y}"), end));
+        }
+    }
+    assert!(ends.len() >= 20, "only {} tag rows found", ends.len());
+    all_agree("tag column right edge", &ends);
+}
+
+#[test]
+fn every_slider_readout_starts_in_one_column() {
+    let mut lefts = Vec::new();
+    for (pane, _, shell) in panes() {
+        for placed in texts(&shell) {
+            if ["10 ms", "40", "200", "50"].contains(&placed.content.as_str()) {
+                lefts.push((format!("{pane} {:?}", placed.content), placed.bounds.x));
+            }
+        }
+    }
+    assert!(lefts.len() >= 5, "only {} readouts found", lefts.len());
+    all_agree("readout column", &lefts);
+}
+
+/// Rows whose first control is a text input, on the panes that show them.
+const INPUT_ROWS: [(Section, &str); 5] = [
+    (Section::Performance, "Stage 1"),
+    (Section::Performance, "Stage 2"),
+    (Section::Performance, "Stage 3"),
+    (Section::Device, "Export profile"),
+    (Section::Device, "Import profile"),
+];
+
+#[test]
+fn every_rows_first_input_starts_in_the_control_column() {
+    let mut firsts = Vec::new();
+    for (state, snap) in [
+        ("empty", snapshot()),
+        ("remembered", remembered()),
+        ("widest", widest()),
+    ] {
+        for (section, label) in INPUT_ROWS {
+            let shell = on_section(snap.clone(), section);
+            let Some(row) = texts(&shell)
+                .into_iter()
+                .find(|placed| placed.content == label)
+            else {
+                panic!("{section:?} {state}: no {label:?} label");
+            };
+            let y = centre_y(&row.bounds);
+            let first = inputs(&shell)
+                .into_iter()
+                .filter(|bounds| (centre_y(bounds) - y).abs() < 12.0)
+                .map(|bounds| bounds.x)
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                first.is_finite(),
+                "{section:?} {state}: no input on the {label:?} row"
+            );
+            firsts.push((format!("{section:?} {state} {label:?}"), first));
+        }
+    }
+    all_agree("control column", &firsts);
+}
+
+/// A bind picker's horizontal padding (12 each side) plus its arrow (9.1 px at
+/// text size 14, rounded up): what a `KEY_PICKER_WIDTH` picker keeps from text.
+const PICKER_CHROME: f32 = 24.0 + 10.0;
+
+/// Pick lists report no text to the selector, so a name too wide for its
+/// picker cannot show up in the grid checks above: measure every name a bind
+/// picker offers, at the picker's text size, in the UI font and in the
+/// default font it falls back to.
+#[test]
+fn every_bind_picker_name_fits_the_picker() {
+    let room = KEY_PICKER_WIDTH - PICKER_CHROME;
+    let mut names: Vec<&str> = Vec::new();
+    names.extend(crate::parse::MOUSE_FN_NAMES);
+    names.extend(crate::parse::MEDIA_FN_NAMES);
+    names.extend(crate::parse::DPI_FN_NAMES);
+    names.extend(crate::parse::KEYBOARD_FN_NAMES);
+    names.extend(gctl_proto::Key::all().map(gctl_proto::Key::name));
+    assert!(names.len() > 100, "only {} names", names.len());
+    for name in names {
+        for font in [iced::Font::DEFAULT, UI_FONT] {
+            let mut ui = simulator(iced::widget::text(name).size(14).font(font).into());
+            let mut width = 0.0f32;
+            let _ = ui.find(|candidate: iced_test::selector::Candidate<'_>| {
+                if let iced_test::selector::Candidate::Text { bounds, .. } = candidate {
+                    width = width.max(bounds.width);
+                }
+                None::<()>
+            });
+            assert!(width > 0.0, "{name:?}: nothing measured");
+            assert!(
+                width <= room,
+                "{name:?} is {width} wide in {font:?}, a picker keeps {room}"
+            );
+        }
+    }
+}
+
+/// How far a button's label may sit from the edge its button starts at: the
+/// button's own padding plus a little.
+const BUTTON_INSET: f32 = 24.0;
+
+fn one<'a>(placed: &'a [Placed], content: &str) -> &'a Placed {
+    let found: Vec<&Placed> = placed.iter().filter(|p| p.content == content).collect();
+    assert_eq!(found.len(), 1, "{content:?} found {} times", found.len());
+    found[0]
+}
+
+/// An action button is as wide as its label plus padding, never as wide as the
+/// space around it: each label sits next to the edge its button is anchored
+/// to, not centred in a stretched button.
+#[test]
+fn action_buttons_hug_their_labels() {
+    for (state, snap) in [("empty", snapshot()), ("remembered", remembered())] {
+        let shell = on_section(snap, Section::Performance);
+        let placed = texts(&shell);
+        let card_right = tag_row_ends(&placed)
+            .into_iter()
+            .map(|(_, end)| end)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let label_x = one(&placed, "Stage 1").bounds.x;
+        let stage_y = centre_y(&one(&placed, "Stage 1").bounds);
+        let control_x = inputs(&shell)
+            .into_iter()
+            .filter(|bounds| (centre_y(bounds) - stage_y).abs() < 12.0)
+            .map(|bounds| bounds.x)
+            .fold(f32::INFINITY, f32::min);
+
+        let apply = one(&placed, "Apply").bounds;
+        let apply_gap = (card_right - (apply.x + apply.width)).abs();
+        assert!(
+            apply_gap <= BUTTON_INSET,
+            "{state}: Apply's label ends {apply_gap} from the card's right edge"
+        );
+
+        let revert_gap = (one(&placed, "Revert").bounds.x - label_x).abs();
+        assert!(
+            revert_gap <= BUTTON_INSET,
+            "{state}: Revert's label starts {revert_gap} from the label column"
+        );
+
+        let add_gap = one(&placed, "Add stage").bounds.x - control_x;
+        assert!(
+            (0.0..=BUTTON_INSET).contains(&add_gap),
+            "{state}: Add stage's label starts {add_gap} past the control column"
+        );
+
+        // each Remove follows the last input on its stage row
+        for remove in placed.iter().filter(|p| p.content == "Remove") {
+            let y = centre_y(&remove.bounds);
+            let input_end = inputs(&shell)
+                .into_iter()
+                .filter(|bounds| (centre_y(bounds) - y).abs() < 12.0)
+                .map(|bounds| bounds.x + bounds.width)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let gap = remove.bounds.x - input_end;
+            assert!(
+                (0.0..=BUTTON_INSET + 8.0).contains(&gap),
+                "{state}: Remove's label starts {gap} past its row's last input"
+            );
+        }
+    }
+}
+
+fn encloses(outer: &Rectangle, inner: &Rectangle) -> bool {
+    outer.x <= inner.x + 0.5
+        && outer.y <= inner.y + 0.5
+        && outer.x + outer.width + 0.5 >= inner.x + inner.width
+        && outer.y + outer.height + 0.5 >= inner.y + inner.height
+}
+
+/// Each `label`'s text bounds and its button: the smallest enclosing container
+/// 30-40 px tall and at least 10 px wider than the label.
+fn buttons_around(
+    case: &str,
+    shell: &Shell,
+    labels: &[&str],
+) -> Vec<(String, Rectangle, Rectangle)> {
+    let mut ui = simulator(shell.view());
+    let mut texts: Vec<(String, Rectangle)> = Vec::new();
+    let mut boxes: Vec<Rectangle> = Vec::new();
+    let _ = ui.find(|candidate: iced_test::selector::Candidate<'_>| {
+        if let iced_test::selector::Candidate::Text {
+            content, bounds, ..
+        } = candidate
+        {
+            texts.push((content.to_owned(), bounds));
+        } else if let iced_test::selector::Candidate::Container { bounds, .. } = candidate {
+            boxes.push(bounds);
+        }
+        None::<()>
+    });
+    let mut found = Vec::new();
+    for label in labels {
+        let mut any = false;
+        for (content, text) in texts.iter().filter(|(c, _)| c == label) {
+            let button = boxes
+                .iter()
+                .filter(|b| {
+                    encloses(b, text)
+                        && b.width > text.width + 10.0
+                        && (30.0..=40.0).contains(&b.height)
+                })
+                .min_by(|a, b| a.width.total_cmp(&b.width))
+                .unwrap_or_else(|| panic!("{case}: no button around {content:?}"));
+            found.push((content.clone(), *text, *button));
+            any = true;
+        }
+        assert!(any, "{case}: no {label:?} label");
+    }
+    found
+}
+
+/// Every action button on every pane and modal is its label plus padding wide,
+/// and the two fixed-width file buttons centre their label: a stretch at any
+/// one button fails here, not only one at the shared label helper.
+#[test]
+fn every_action_button_hugs_its_label() {
+    let mut cases: Vec<(&str, Shell, Vec<&str>)> = vec![(
+        "performance",
+        shell(snapshot()),
+        vec!["Remove", "Add stage", "Apply", "Revert"],
+    )];
+    let mut pulse = snapshot();
+    pulse.effect = Some(Effect::Pulse {
+        rate: Rate::new(40).unwrap(),
+        colors: vec![rgb("ff0000"), rgb("00ff00"), rgb("0000ff")],
+    });
+    cases.push((
+        "lighting pulse",
+        on_section(pulse, Section::Lighting),
+        vec!["Add colour", "Remove"],
+    ));
+    let mut make_active = shell(snapshot());
+    make_active.machine.update(Msg::PickProfile(profile(3)));
+    make_active.machine.update(Msg::Loaded(Ok(Snapshot {
+        profile: profile(3),
+        ..snapshot()
+    })));
+    cases.push(("make active", make_active, vec!["Make active"]));
+    let mut machine = State::new().0;
+    machine.update(Msg::Loaded(Ok(snapshot())));
+    machine.update(Msg::Edit(Edit::Debounce(0)));
+    machine.update(Msg::Select(Section::Lighting));
+    cases.push((
+        "discard modal",
+        shell_with_machine(machine),
+        vec!["Keep editing", "Discard"],
+    ));
+    let mut import = shell(snapshot());
+    import
+        .machine
+        .update(Msg::Import(std::path::PathBuf::from("/o.toml")));
+    import
+        .machine
+        .update(Msg::ImportChecked(Ok(crate::gui::state::ImportCheck {
+            note: None,
+            device_wide: true,
+            writes: Vec::new(),
+        })));
+    cases.push(("import modal", import, vec!["Cancel", "Import"]));
+
+    let mut wrong = Vec::new();
+    for (case, shell, labels) in &cases {
+        for (content, text, button) in buttons_around(case, shell, labels) {
+            if button.width - text.width > 22.0 {
+                wrong.push(format!(
+                    "{case} {content:?}: button {:.1} for label {:.1}",
+                    button.width, text.width
+                ));
+            }
+        }
+    }
+    let mut three = snapshot();
+    three.profile = profile(3);
+    three.active = profile(3);
+    for (case, snap) in [("device p2", snapshot()), ("device p3", three)] {
+        let shell = on_section(snap, Section::Device);
+        let id = shell.machine.live_snapshot().unwrap().profile.get();
+        let labels = [
+            format!("Export profile {id}"),
+            format!("Import into profile {id}"),
+        ];
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        for (content, text, button) in buttons_around(case, &shell, &refs) {
+            let dx = (text.x + text.width / 2.0) - (button.x + button.width / 2.0);
+            let dy = (text.y + text.height / 2.0) - (button.y + button.height / 2.0);
+            if (button.width - FILE_BUTTON_WIDTH).abs() > 0.5
+                || dx.abs() > 1.0
+                || dy.abs() > 1.0
+                || text.height > 20.0
+            {
+                wrong.push(format!(
+                    "{case} {content:?}: width {:.1}, off centre {dx:.2},{dy:.2}, label {:.1} tall",
+                    button.width, text.height
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

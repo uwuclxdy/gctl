@@ -9,7 +9,8 @@ use crate::memory::Memory;
 use crate::parse;
 use crate::{CmdError, check_awake, resolve_profile, validate_profile, write_out};
 
-const ALL_BUTTONS: [Button; 8] = [
+/// The eight rebindable buttons, in the order the CLI lists them.
+pub(crate) const BUTTONS: [Button; 8] = [
     Button::Left,
     Button::Right,
     Button::Scroll,
@@ -266,7 +267,7 @@ fn get_all<T: Transport>(
                 .as_deref()
         )
     ));
-    for button in ALL_BUTTONS {
+    for button in BUTTONS {
         let button_name = parse::format_button(button);
         let value = memory
             .bind(name, profile, button)

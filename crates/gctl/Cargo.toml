@@ -9,12 +9,22 @@ license.workspace = true
 gctl-proto.workspace = true
 clap.workspace = true
 hidapi.workspace = true
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu",
+    "tiny-skia",
+    "wayland",
+    "x11",
+    "tokio",
+    "crisp",
+] }
 serde.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt"] }
 toml.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+iced_test = "0.14"
 
 [lints]
 workspace = true

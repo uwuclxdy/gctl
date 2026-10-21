@@ -27,18 +27,18 @@ pub(crate) fn require_state_dir(state_dir: Option<&Path>) -> Result<&Path, CmdEr
 
 /// The typed, in-memory state. The scroll direction is never stored: it is
 /// derived from the six remembered scroll binds.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Memory {
     model: BTreeMap<String, ModelMem>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ModelMem {
     pub(crate) brightness: Option<Brightness>,
     profile: HashMap<Profile, ProfileMem>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ProfileMem {
     pub(crate) effect: Option<Effect>,
     pub(crate) dpi_colors: Option<Vec<Rgb>>,

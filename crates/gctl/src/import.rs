@@ -11,9 +11,8 @@ use gctl_proto::{
 };
 use serde::Deserialize;
 
-use crate::memory::Memory;
 use crate::parse;
-use crate::writes;
+use crate::writes::{self, WriteOp};
 use crate::{CmdError, check_awake, resolve_profile, validate_profile};
 
 #[derive(Deserialize)]
@@ -53,7 +52,7 @@ struct ImportProfile {
     binds: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ValidDevice {
     polling_rate: Option<PollingRate>,
     lift_off: Option<LiftOff>,
@@ -62,7 +61,7 @@ struct ValidDevice {
     scroll: Option<ScrollDirection>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ValidProfile {
     dpi: Option<DpiStages>,
     dpi_stage: Option<DpiStage>,
@@ -72,6 +71,7 @@ struct ValidProfile {
     binds: Vec<(Button, Binding)>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct PreparedImport {
     path: PathBuf,
     profile: Option<Profile>,
@@ -83,6 +83,28 @@ pub(crate) struct PreparedImport {
 }
 
 impl PreparedImport {
+    /// Whether the file carries a `[device]` table, so importing needs confirmation.
+    pub(crate) fn has_device_table(&self) -> bool {
+        self.has_device_table
+    }
+
+    /// The writes the file will make, in import order; the same list `execute`
+    /// passes to `writes::apply`.
+    pub(crate) fn writes(&self) -> Vec<WriteOp> {
+        build_writes(&self.device_settings, &self.profile_settings)
+    }
+
+    /// The model-mismatch note, or `None` when the models match. The one source
+    /// for the note, shared by the CLI's `confirm` and the GUI's import modal.
+    pub(crate) fn model_note(&self, device_name: &str) -> Option<String> {
+        (self.model != device_name).then(|| {
+            format!(
+                "note: {:?} holds settings for {:?}; writing them to {}",
+                self.path, self.model, device_name
+            )
+        })
+    }
+
     /// Prints the model note and asks for confirmation, before the lock is taken.
     pub(crate) fn confirm(
         &self,
@@ -91,12 +113,8 @@ impl PreparedImport {
         stderr: &mut dyn Write,
         interactive: bool,
     ) -> Result<(), CmdError> {
-        if self.model != device_name {
-            let _ = writeln!(
-                stderr,
-                "note: {:?} holds settings for {:?}; writing them to {}",
-                self.path, self.model, device_name
-            );
+        if let Some(note) = self.model_note(device_name) {
+            let _ = writeln!(stderr, "{note}");
         }
         if self.has_device_table && !self.yes {
             if !interactive {
@@ -156,17 +174,34 @@ pub(crate) fn execute<T: Transport>(
     device: &Device<T>,
     state_dir: Option<&Path>,
     prepared: PreparedImport,
-) -> Result<(), CmdError> {
-    check_awake(device)?;
-    let profile = resolve_profile(device, prepared.profile)?;
-    check_against_device(device, &prepared.path, profile, &prepared.profile_settings)?;
-    apply(
-        device,
-        state_dir,
-        profile,
-        &prepared.device_settings,
-        &prepared.profile_settings,
-    )
+) -> Result<Vec<WriteOp>, CmdError> {
+    execute_landed(device, state_dir, prepared).map_err(|failure| failure.error)
+}
+
+/// `execute` with the ops that landed, on success and on a fail-fast error.
+pub(crate) fn execute_landed<T: Transport>(
+    device: &Device<T>,
+    state_dir: Option<&Path>,
+    prepared: PreparedImport,
+) -> Result<Vec<WriteOp>, writes::WriteError> {
+    check_awake(device).map_err(|error| writes::WriteError {
+        error,
+        landed: Vec::new(),
+    })?;
+    let profile =
+        resolve_profile(device, prepared.profile).map_err(|error| writes::WriteError {
+            error,
+            landed: Vec::new(),
+        })?;
+    check_against_device(device, &prepared.path, profile, &prepared.profile_settings).map_err(
+        |error| writes::WriteError {
+            error,
+            landed: Vec::new(),
+        },
+    )?;
+    let ops = build_writes(&prepared.device_settings, &prepared.profile_settings);
+    writes::apply(device, state_dir, profile, &ops)?;
+    Ok(ops)
 }
 
 fn validate_device(path: &Path, device: Option<&ImportDevice>) -> Result<ValidDevice, CmdError> {
@@ -314,62 +349,6 @@ fn check_against_device<T: Transport>(
     Ok(())
 }
 
-/// One device write the import makes, in cli.md's order.
-enum WriteOp {
-    PollingRate(PollingRate),
-    LiftOff(LiftOff),
-    Sleep(SleepDelay),
-    Brightness(Brightness),
-    Scroll(ScrollDirection),
-    Dpi(DpiStages),
-    DpiStage(DpiStage),
-    DpiColors(Vec<Rgb>),
-    Debounce(Debounce),
-    Effect(Effect),
-    Bind(Button, Binding),
-}
-
-impl WriteOp {
-    /// Whether the write records or clears a remembered value, so it needs a
-    /// readable memory loaded before the first write. The match is exhaustive,
-    /// so a new variant cannot skip the question.
-    fn needs_memory(&self) -> bool {
-        match self {
-            WriteOp::PollingRate(_)
-            | WriteOp::LiftOff(_)
-            | WriteOp::Sleep(_)
-            | WriteOp::DpiStage(_)
-            | WriteOp::Debounce(_) => false,
-            WriteOp::Brightness(_)
-            | WriteOp::Scroll(_)
-            | WriteOp::Dpi(_)
-            | WriteOp::DpiColors(_)
-            | WriteOp::Effect(_)
-            | WriteOp::Bind(_, _) => true,
-        }
-    }
-}
-
-fn apply<T: Transport>(
-    device: &Device<T>,
-    state_dir: Option<&Path>,
-    profile: Profile,
-    device_settings: &ValidDevice,
-    profile_settings: &ValidProfile,
-) -> Result<(), CmdError> {
-    let ops = build_writes(device_settings, profile_settings);
-    // Before the first write: memory loads iff some operation records one, so a
-    // refusal leaves the mouse untouched. The question is answered by the same
-    // variants the writes run, so the gate cannot drift from them.
-    if ops.iter().any(WriteOp::needs_memory) {
-        writes::with_memory(state_dir, |memory| {
-            run_writes(device, profile, &ops, memory)
-        })
-    } else {
-        run_writes(device, profile, &ops, &mut Memory::default()).map_err(CmdError::from)
-    }
-}
-
 fn build_writes(device_settings: &ValidDevice, profile_settings: &ValidProfile) -> Vec<WriteOp> {
     let mut ops = Vec::new();
     if let Some(rate) = device_settings.polling_rate {
@@ -406,32 +385,6 @@ fn build_writes(device_settings: &ValidDevice, profile_settings: &ValidProfile) 
         ops.push(WriteOp::Bind(*button, *binding));
     }
     ops
-}
-
-fn run_writes<T: Transport>(
-    device: &Device<T>,
-    profile: Profile,
-    ops: &[WriteOp],
-    memory: &mut Memory,
-) -> gctl_proto::Result<()> {
-    for op in ops {
-        match op {
-            WriteOp::PollingRate(rate) => device.set_polling_rate(*rate)?,
-            WriteOp::LiftOff(lift_off) => device.set_lift_off(*lift_off)?,
-            WriteOp::Sleep(sleep) => device.set_sleep_delay(*sleep)?,
-            WriteOp::Brightness(brightness) => writes::brightness(device, *brightness, memory)?,
-            WriteOp::Scroll(direction) => writes::scroll(device, *direction, memory)?,
-            WriteOp::Dpi(stages) => writes::dpi_stages(device, profile, stages, memory)?,
-            WriteOp::DpiStage(stage) => device.set_dpi_stage(profile, *stage)?,
-            WriteOp::DpiColors(colors) => writes::dpi_colors(device, profile, colors, memory)?,
-            WriteOp::Debounce(debounce) => device.set_debounce(profile, *debounce)?,
-            WriteOp::Effect(effect) => writes::effect(device, profile, effect, memory)?,
-            WriteOp::Bind(button, binding) => {
-                writes::bind(device, profile, *button, *binding, memory)?
-            }
-        }
-    }
-    Ok(())
 }
 
 fn field_error(path: &Path, key: &str, error: parse::ParseError) -> CmdError {

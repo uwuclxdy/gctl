@@ -16,7 +16,7 @@ fn run_main() -> u8 {
     let mut lock = || -> Result<(), gctl::HostError> {
         let Some(path) = lock_path.clone() else {
             return Err(gctl::HostError::from(std::io::Error::other(
-                "cannot find a place for the lock file; set XDG_RUNTIME_DIR or HOME",
+                gctl::NO_LOCK_LOCATION,
             )));
         };
         let file = gctl::take_lock(&path, &mut std::io::stderr().lock())?;
@@ -54,8 +54,15 @@ fn run_main() -> u8 {
 
     match outcome {
         Outcome::Exit(code) => code,
-        Outcome::Gui | Outcome::Tray => {
-            eprintln!("error: the GUI is not built yet");
+        Outcome::Gui => match gctl::gui::run(state_dir.as_deref(), lock_path) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("error: {error}");
+                1
+            }
+        },
+        Outcome::Tray => {
+            eprintln!("error: the tray is not built yet");
             1
         }
     }

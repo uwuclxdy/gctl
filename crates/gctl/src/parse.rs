@@ -39,9 +39,15 @@ fn needs_escaping(c: char) -> bool {
     !matches!(c, '"' | '\'' | '\\') && c.escape_debug().nth(1).is_some()
 }
 
+/// Whether `value` is a non-empty whole decimal number with no sign and no
+/// separators. The GUI's sleep minutes/seconds fields refuse anything else.
+pub fn is_whole_number(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Parses a non-negative integer with no leading `+` and no sign at all.
 fn digits<T: std::str::FromStr>(s: &str) -> Result<T, ()> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+    if !is_whole_number(s) {
         return Err(());
     }
     s.parse().map_err(|_| ())
@@ -213,6 +219,86 @@ pub fn format_scroll(direction: ScrollDirection) -> &'static str {
     }
 }
 
+/// The modifier bits and their names, in the CLI's order. The one table
+/// [`binding`], [`format_binding`] and the GUI's key toggles all read, so a
+/// modifier name cannot drift between them.
+pub const MODIFIERS: [(Modifiers, &str); 5] = [
+    (Modifiers::CTRL_LEFT, "ctrl"),
+    (Modifiers::SHIFT_LEFT, "shift"),
+    (Modifiers::ALT_LEFT, "alt"),
+    (Modifiers::META_LEFT, "meta"),
+    (Modifiers::META_RIGHT, "meta-right"),
+];
+
+/// The modifier names a key bind takes, in the CLI's order.
+pub const MODIFIER_NAMES: [&str; 5] = modifier_names(MODIFIERS);
+
+const fn modifier_names(table: [(Modifiers, &str); 5]) -> [&str; 5] {
+    [table[0].1, table[1].1, table[2].1, table[3].1, table[4].1]
+}
+
+/// The modifier bit a modifier name sets, the one mapping for `binding` and the
+/// GUI's modifier toggles.
+pub fn modifier_bits(name: &str) -> Option<Modifiers> {
+    MODIFIERS
+        .iter()
+        .find(|(_, modifier)| *modifier == name)
+        .map(|(bits, _)| *bits)
+}
+
+/// A binding family, paired with its token in [`BIND_FAMILIES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindCategory {
+    None,
+    Mouse,
+    Media,
+    Dpi,
+    Keyboard,
+    Key,
+}
+
+/// The token a family category is spelled with. The match is exhaustive, so a
+/// new category is a compile error, never an out-of-range index.
+pub const fn family_token(category: BindCategory) -> &'static str {
+    match category {
+        BindCategory::None => "none",
+        BindCategory::Mouse => "mouse",
+        BindCategory::Media => "media",
+        BindCategory::Dpi => "dpi",
+        BindCategory::Keyboard => "keyboard",
+        BindCategory::Key => "key",
+    }
+}
+
+/// The one table pairing each family token with its category, read by the
+/// parser, the formatter and the window. The tokens come from [`family_token`],
+/// the single source, so a category cannot drift from its token.
+pub const BIND_FAMILIES: [(BindCategory, &str); 6] = [
+    (BindCategory::None, family_token(BindCategory::None)),
+    (BindCategory::Mouse, family_token(BindCategory::Mouse)),
+    (BindCategory::Media, family_token(BindCategory::Media)),
+    (BindCategory::Dpi, family_token(BindCategory::Dpi)),
+    (BindCategory::Keyboard, family_token(BindCategory::Keyboard)),
+    (BindCategory::Key, family_token(BindCategory::Key)),
+];
+
+/// The family tokens, in the CLI's order, for a picker's option list.
+pub const BIND_FAMILY_TOKENS: [&str; 6] = family_tokens(BIND_FAMILIES);
+
+const fn family_tokens(table: [(BindCategory, &str); 6]) -> [&str; 6] {
+    [
+        table[0].1, table[1].1, table[2].1, table[3].1, table[4].1, table[5].1,
+    ]
+}
+
+/// The category a family token names, `None` for an unknown token.
+pub fn bind_category(token: &str) -> Option<BindCategory> {
+    BIND_FAMILIES
+        .iter()
+        .find(|(_, family)| *family == token)
+        .map(|(category, _)| *category)
+}
+
 /// `key:[mod+]...<Code>`, `mouse:<fn>`, `media:<fn>`, `dpi:<fn>`, `keyboard:<fn>` or `none`;
 /// modifiers are `ctrl`, `shift`, `alt`, `meta`, `meta-right`.
 pub fn binding(s: &str) -> Result<Binding, ParseError> {
@@ -222,8 +308,8 @@ pub fn binding(s: &str) -> Result<Binding, ParseError> {
     let (family, rest) = s
         .split_once(':')
         .ok_or_else(|| err(format!("invalid binding {s:?}")))?;
-    match family {
-        "key" => {
+    match bind_category(family) {
+        Some(BindCategory::Key) => {
             let mut parts = rest.split('+');
             let key_name = parts
                 .next_back()
@@ -232,72 +318,50 @@ pub fn binding(s: &str) -> Result<Binding, ParseError> {
             let mut modifiers = Modifiers::NONE;
             for name in parts {
                 modifiers = modifiers
-                    | match name {
-                        "ctrl" => Modifiers::CTRL_LEFT,
-                        "shift" => Modifiers::SHIFT_LEFT,
-                        "alt" => Modifiers::ALT_LEFT,
-                        "meta" => Modifiers::META_LEFT,
-                        "meta-right" => Modifiers::META_RIGHT,
-                        _ => return Err(err(format!("unknown modifier {name:?}"))),
-                    };
+                    | modifier_bits(name)
+                        .ok_or_else(|| err(format!("unknown modifier {name:?}")))?;
             }
             Ok(Binding::Key { key, modifiers })
         }
-        "mouse" => Ok(Binding::Mouse(match rest {
-            "left" => MouseFn::Left,
-            "right" => MouseFn::Right,
-            "scroll" => MouseFn::Scroll,
-            "back" => MouseFn::Back,
-            "forward" => MouseFn::Forward,
-            "scroll-up" => MouseFn::ScrollUp,
-            "scroll-down" => MouseFn::ScrollDown,
-            "profile-cycle-up" => MouseFn::ProfileCycleUp,
-            "profile-cycle-down" => MouseFn::ProfileCycleDown,
-            "battery-status" => MouseFn::BatteryStatus,
-            _ => return Err(err(format!("unknown mouse function {rest:?}"))),
-        })),
-        "media" => Ok(Binding::Media(match rest {
-            "player" => MediaFn::Player,
-            "play-pause" => MediaFn::PlayPause,
-            "next" => MediaFn::Next,
-            "previous" => MediaFn::Previous,
-            "stop" => MediaFn::Stop,
-            "mute" => MediaFn::Mute,
-            "volume-up" => MediaFn::VolumeUp,
-            "volume-down" => MediaFn::VolumeDown,
-            _ => return Err(err(format!("unknown media function {rest:?}"))),
-        })),
-        "dpi" => Ok(Binding::Dpi(match rest {
-            "stage-up" => DpiFn::StageUp,
-            "stage-down" => DpiFn::StageDown,
-            "cycle-up" => DpiFn::CycleUp,
-            "cycle-down" => DpiFn::CycleDown,
-            _ => return Err(err(format!("unknown DPI function {rest:?}"))),
-        })),
-        "keyboard" => Ok(Binding::Keyboard(match rest {
-            "profile-cycle-up" => KeyboardFn::ProfileCycleUp,
-            "profile-cycle-down" => KeyboardFn::ProfileCycleDown,
-            "layer-cycle-up" => KeyboardFn::LayerCycleUp,
-            "layer-cycle-down" => KeyboardFn::LayerCycleDown,
-            _ => return Err(err(format!("unknown keyboard function {rest:?}"))),
-        })),
-        _ => Err(err(format!("unknown binding family {family:?}"))),
+        Some(BindCategory::Mouse) => {
+            let function = fn_of(rest, &MOUSE_FN_ALL, mouse_fn_name)
+                .ok_or_else(|| err(format!("unknown mouse function {rest:?}")))?;
+            Ok(Binding::Mouse(function))
+        }
+        Some(BindCategory::Media) => {
+            let function = fn_of(rest, &MEDIA_FN_ALL, media_fn_name)
+                .ok_or_else(|| err(format!("unknown media function {rest:?}")))?;
+            Ok(Binding::Media(function))
+        }
+        Some(BindCategory::Dpi) => {
+            let function = fn_of(rest, &DPI_FN_ALL, dpi_fn_name)
+                .ok_or_else(|| err(format!("unknown DPI function {rest:?}")))?;
+            Ok(Binding::Dpi(function))
+        }
+        Some(BindCategory::Keyboard) => {
+            let function = fn_of(rest, &KEYBOARD_FN_ALL, keyboard_fn_name)
+                .ok_or_else(|| err(format!("unknown keyboard function {rest:?}")))?;
+            Ok(Binding::Keyboard(function))
+        }
+        Some(BindCategory::None) | None => Err(err(format!("unknown binding family {family:?}"))),
     }
 }
 
-/// Inverse of [`binding`].
+/// The function in `all` whose formatter output is `name`.
+fn fn_of<T: Copy>(name: &str, all: &[T], format: fn(T) -> &'static str) -> Option<T> {
+    all.iter()
+        .copied()
+        .find(|function| format(*function) == name)
+}
+
+/// Inverse of [`binding`]. The family tokens read [`family_token`], the one
+/// table the parser, the formatter and the window share.
 pub fn format_binding(binding: Binding) -> String {
     match binding {
         Binding::Key { key, modifiers } => {
-            let mut out = String::from("key:");
-            for (bit, name) in [
-                (Modifiers::CTRL_LEFT, "ctrl"),
-                (Modifiers::SHIFT_LEFT, "shift"),
-                (Modifiers::ALT_LEFT, "alt"),
-                (Modifiers::META_LEFT, "meta"),
-                (Modifiers::META_RIGHT, "meta-right"),
-            ] {
-                if modifiers.bits() & bit.bits() != 0 {
+            let mut out = format!("{}:", family_token(BindCategory::Key));
+            for (bits, name) in MODIFIERS {
+                if modifiers.bits() & bits.bits() != 0 {
                     out.push_str(name);
                     out.push('+');
                 }
@@ -305,15 +369,135 @@ pub fn format_binding(binding: Binding) -> String {
             out.push_str(key.name());
             out
         }
-        Binding::Mouse(function) => format!("mouse:{}", mouse_fn_name(function)),
-        Binding::Media(function) => format!("media:{}", media_fn_name(function)),
-        Binding::Dpi(function) => format!("dpi:{}", dpi_fn_name(function)),
-        Binding::Keyboard(function) => format!("keyboard:{}", keyboard_fn_name(function)),
-        Binding::None => "none".to_owned(),
+        Binding::Mouse(function) => {
+            format!(
+                "{}:{}",
+                family_token(BindCategory::Mouse),
+                mouse_fn_name(function)
+            )
+        }
+        Binding::Media(function) => {
+            format!(
+                "{}:{}",
+                family_token(BindCategory::Media),
+                media_fn_name(function)
+            )
+        }
+        Binding::Dpi(function) => {
+            format!(
+                "{}:{}",
+                family_token(BindCategory::Dpi),
+                dpi_fn_name(function)
+            )
+        }
+        Binding::Keyboard(function) => {
+            format!(
+                "{}:{}",
+                family_token(BindCategory::Keyboard),
+                keyboard_fn_name(function)
+            )
+        }
+        Binding::None => family_token(BindCategory::None).to_owned(),
     }
 }
 
-fn mouse_fn_name(function: MouseFn) -> &'static str {
+/// Maps a variant list through its name formatter, so a new enum variant
+/// compiles into the formatter and cannot miss the picker's name list.
+const fn mouse_names(all: [MouseFn; 10]) -> [&'static str; 10] {
+    let mut names = [""; 10];
+    let mut i = 0;
+    while i < 10 {
+        names[i] = mouse_fn_name(all[i]);
+        i += 1;
+    }
+    names
+}
+
+const fn media_names(all: [MediaFn; 8]) -> [&'static str; 8] {
+    let mut names = [""; 8];
+    let mut i = 0;
+    while i < 8 {
+        names[i] = media_fn_name(all[i]);
+        i += 1;
+    }
+    names
+}
+
+const fn dpi_names(all: [DpiFn; 4]) -> [&'static str; 4] {
+    let mut names = [""; 4];
+    let mut i = 0;
+    while i < 4 {
+        names[i] = dpi_fn_name(all[i]);
+        i += 1;
+    }
+    names
+}
+
+const fn keyboard_names(all: [KeyboardFn; 4]) -> [&'static str; 4] {
+    let mut names = [""; 4];
+    let mut i = 0;
+    while i < 4 {
+        names[i] = keyboard_fn_name(all[i]);
+        i += 1;
+    }
+    names
+}
+
+/// Every mouse function, in the CLI's order.
+pub const MOUSE_FN_ALL: [MouseFn; 10] = [
+    MouseFn::Left,
+    MouseFn::Right,
+    MouseFn::Scroll,
+    MouseFn::Back,
+    MouseFn::Forward,
+    MouseFn::ScrollUp,
+    MouseFn::ScrollDown,
+    MouseFn::ProfileCycleUp,
+    MouseFn::ProfileCycleDown,
+    MouseFn::BatteryStatus,
+];
+
+/// Every media function, in the CLI's order.
+pub const MEDIA_FN_ALL: [MediaFn; 8] = [
+    MediaFn::Player,
+    MediaFn::PlayPause,
+    MediaFn::Next,
+    MediaFn::Previous,
+    MediaFn::Stop,
+    MediaFn::Mute,
+    MediaFn::VolumeUp,
+    MediaFn::VolumeDown,
+];
+
+/// Every DPI function, in the CLI's order.
+pub const DPI_FN_ALL: [DpiFn; 4] = [
+    DpiFn::StageUp,
+    DpiFn::StageDown,
+    DpiFn::CycleUp,
+    DpiFn::CycleDown,
+];
+
+/// Every keyboard function, in the CLI's order.
+pub const KEYBOARD_FN_ALL: [KeyboardFn; 4] = [
+    KeyboardFn::ProfileCycleUp,
+    KeyboardFn::ProfileCycleDown,
+    KeyboardFn::LayerCycleUp,
+    KeyboardFn::LayerCycleDown,
+];
+
+/// Every mouse function name, in the CLI's order, derived from [`MOUSE_FN_ALL`].
+pub const MOUSE_FN_NAMES: [&str; 10] = mouse_names(MOUSE_FN_ALL);
+
+/// Every media function name, in the CLI's order.
+pub const MEDIA_FN_NAMES: [&str; 8] = media_names(MEDIA_FN_ALL);
+
+/// Every DPI function name, in the CLI's order.
+pub const DPI_FN_NAMES: [&str; 4] = dpi_names(DPI_FN_ALL);
+
+/// Every keyboard function name, in the CLI's order.
+pub const KEYBOARD_FN_NAMES: [&str; 4] = keyboard_names(KEYBOARD_FN_ALL);
+
+const fn mouse_fn_name(function: MouseFn) -> &'static str {
     match function {
         MouseFn::Left => "left",
         MouseFn::Right => "right",
@@ -328,7 +512,7 @@ fn mouse_fn_name(function: MouseFn) -> &'static str {
     }
 }
 
-fn media_fn_name(function: MediaFn) -> &'static str {
+const fn media_fn_name(function: MediaFn) -> &'static str {
     match function {
         MediaFn::Player => "player",
         MediaFn::PlayPause => "play-pause",
@@ -341,7 +525,7 @@ fn media_fn_name(function: MediaFn) -> &'static str {
     }
 }
 
-fn dpi_fn_name(function: DpiFn) -> &'static str {
+const fn dpi_fn_name(function: DpiFn) -> &'static str {
     match function {
         DpiFn::StageUp => "stage-up",
         DpiFn::StageDown => "stage-down",
@@ -350,7 +534,7 @@ fn dpi_fn_name(function: DpiFn) -> &'static str {
     }
 }
 
-fn keyboard_fn_name(function: KeyboardFn) -> &'static str {
+const fn keyboard_fn_name(function: KeyboardFn) -> &'static str {
     match function {
         KeyboardFn::ProfileCycleUp => "profile-cycle-up",
         KeyboardFn::ProfileCycleDown => "profile-cycle-down",

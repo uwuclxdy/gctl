@@ -4,6 +4,7 @@ pub mod parse;
 
 mod export;
 mod get;
+pub mod gui;
 mod import;
 mod memory;
 mod set;
@@ -50,6 +51,7 @@ pub struct Env<'a, T> {
 }
 
 /// A command failure, classified by its exit code and how it renders.
+#[derive(Debug)]
 pub(crate) enum CmdError {
     /// A bad argument: exit 2, `error: <message>`.
     Usage(String),
@@ -83,6 +85,23 @@ impl From<parse::ParseError> for CmdError {
 impl From<std::io::Error> for CmdError {
     fn from(error: std::io::Error) -> Self {
         CmdError::Io(error)
+    }
+}
+
+impl CmdError {
+    /// The lines this failure renders after `error: `, in order, shared by the
+    /// CLI's `report` and the GUI's error banner. `BrokenPipe` renders nothing.
+    pub(crate) fn message(&self) -> Vec<String> {
+        match self {
+            CmdError::Usage(message) | CmdError::Message(message) => vec![message.clone()],
+            CmdError::Runtime(error) => vec![error_chain(error)],
+            CmdError::Io(error) => vec![error.to_string()],
+            CmdError::WriteThenSave {
+                device_error,
+                save_message,
+            } => vec![error_chain(device_error), save_message.clone()],
+            CmdError::BrokenPipe => Vec::new(),
+        }
     }
 }
 
@@ -136,6 +155,11 @@ enum Cmd {
         yes: bool,
     },
 }
+
+/// The error when neither `XDG_RUNTIME_DIR` nor the state dir can hold the
+/// lock file, shared by `main` and the GUI.
+pub const NO_LOCK_LOCATION: &str =
+    "cannot find a place for the lock file; set XDG_RUNTIME_DIR or HOME";
 
 /// The state dir: `$XDG_STATE_HOME/gctl`, else `$HOME/.local/state/gctl`. An
 /// empty or relative variable counts as unset; `None` when neither is usable.
@@ -341,10 +365,10 @@ fn dispatch<T: Transport>(
         Prepared::Get(cmd, profile) => get::get(device, state_dir, stdout, cmd, profile),
         Prepared::Set(cmd, profile) => set::set(device, state_dir, cmd, profile),
         Prepared::Export(path, profile) => export::export(device, state_dir, profile, &path),
-        Prepared::Import(prepared) => import::execute(device, state_dir, prepared),
+        Prepared::Import(prepared) => import::execute(device, state_dir, prepared).map(|_| ()),
     };
     match result {
-        Ok(()) => Outcome::Exit(0),
+        Ok(_) => Outcome::Exit(0),
         Err(error) => report(stderr, error),
     }
 }
@@ -394,33 +418,18 @@ pub(crate) fn write_out(stdout: &mut dyn Write, text: &str) -> Result<(), CmdErr
 }
 
 fn report(stderr: &mut dyn Write, error: CmdError) -> Outcome {
-    match error {
-        CmdError::Usage(message) => {
-            let _ = writeln!(stderr, "error: {message}");
-            Outcome::Exit(2)
-        }
-        CmdError::Runtime(error) => {
-            let _ = writeln!(stderr, "error: {}", error_chain(&error));
-            Outcome::Exit(1)
-        }
-        CmdError::Message(message) => {
-            let _ = writeln!(stderr, "error: {message}");
-            Outcome::Exit(1)
-        }
-        CmdError::Io(error) => {
-            let _ = writeln!(stderr, "error: {error}");
-            Outcome::Exit(1)
-        }
-        CmdError::WriteThenSave {
-            device_error,
-            save_message,
-        } => {
-            let _ = writeln!(stderr, "error: {}", error_chain(&device_error));
-            let _ = writeln!(stderr, "error: {save_message}");
-            Outcome::Exit(1)
-        }
-        CmdError::BrokenPipe => Outcome::Exit(0),
+    let code = match &error {
+        CmdError::Usage(_) => 2,
+        CmdError::BrokenPipe => 0,
+        CmdError::Runtime(_)
+        | CmdError::Message(_)
+        | CmdError::Io(_)
+        | CmdError::WriteThenSave { .. } => 1,
+    };
+    for line in error.message() {
+        let _ = writeln!(stderr, "error: {line}");
     }
+    Outcome::Exit(code)
 }
 
 fn clap_error<'a>(

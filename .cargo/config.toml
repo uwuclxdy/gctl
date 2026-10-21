@@ -1,0 +1,4 @@
+# The view tests render headless through iced_test. tiny-skia needs no GPU, so
+# the renderer writes no shader cache under $HOME on CI runners or here.
+[env]
+ICED_TEST_BACKEND = "tiny-skia"

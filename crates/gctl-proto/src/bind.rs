@@ -94,6 +94,11 @@ impl Key {
             .find(|key| key.usage == self.usage)
             .and_then(|key| key.modifier)
     }
+
+    /// Every key the firmware accepts, in the table's order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        KEYS.iter().map(|key| Self { usage: key.usage })
+    }
 }
 
 /// The HID boot-protocol modifier byte, limited to the bits the firmware is known to accept.

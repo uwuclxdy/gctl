@@ -625,7 +625,7 @@ fn a_missing_state_dir_is_created_on_the_first_save() {
     ok(&mouse, &nested, &["set", "brightness", "200", "50"]);
     assert_eq!(
         ok(&mouse, &nested, &["get", "brightness"]),
-        "200 50  (set by gctl)\n"
+        "200 50  (last set by gctl)\n"
     );
 }
 
@@ -743,7 +743,7 @@ fn get_listing_marks_a_remembered_bind() {
     assert!(
         listing
             .lines()
-            .any(|l| l == "bind.back  key:ctrl+KeyA  (set by gctl)"),
+            .any(|l| l == "bind.back  key:ctrl+KeyA  (last set by gctl)"),
         "{listing}"
     );
 }
@@ -1111,19 +1111,19 @@ fn memory_persists_across_runs() {
     );
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "effect"]),
-        "wave rate=40  (set by gctl)\n"
+        "wave rate=40  (last set by gctl)\n"
     );
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "brightness"]),
-        "200 50  (set by gctl)\n"
+        "200 50  (last set by gctl)\n"
     );
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "dpi-colors"]),
-        "ffff00 0000ff ff0000  (set by gctl)\n"
+        "ffff00 0000ff ff0000  (last set by gctl)\n"
     );
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "bind", "back"]),
-        "key:ctrl+KeyA  (set by gctl)\n"
+        "key:ctrl+KeyA  (last set by gctl)\n"
     );
 }
 
@@ -1139,7 +1139,7 @@ fn memory_is_per_profile() {
     assert_eq!(ok(&mouse, dir.path(), &["get", "effect"]), "unknown\n");
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "effect", "--profile", "1"]),
-        "solid 00ff00  (set by gctl)\n"
+        "solid 00ff00  (last set by gctl)\n"
     );
 }
 
@@ -1157,7 +1157,7 @@ fn memory_is_keyed_by_model_name() {
         &["get", "brightness"],
     );
     assert_eq!(
-        cable.stdout, "200 50  (set by gctl)\n",
+        cable.stdout, "200 50  (last set by gctl)\n",
         "same model, cable PID"
     );
     let other = gctl_with(
@@ -1501,7 +1501,7 @@ fn rebinding_a_scroll_button_to_what_the_direction_implies_keeps_it() {
     );
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "scroll"]),
-        "invert  (set by gctl)\n"
+        "invert  (last set by gctl)\n"
     );
 }
 
@@ -1542,7 +1542,7 @@ fn scroll_reads_back_from_six_matching_binds() {
     }
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "scroll"]),
-        "invert  (set by gctl)\n"
+        "invert  (last set by gctl)\n"
     );
 }
 
@@ -1553,7 +1553,7 @@ fn scroll_records_both_scroll_binds_of_every_profile() {
     ok(&mouse, dir.path(), &["set", "scroll", "invert"]);
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "scroll"]),
-        "invert  (set by gctl)\n"
+        "invert  (last set by gctl)\n"
     );
     assert_eq!(
         ok(
@@ -1561,7 +1561,7 @@ fn scroll_records_both_scroll_binds_of_every_profile() {
             dir.path(),
             &["get", "bind", "scroll-up", "--profile", "1"]
         ),
-        "mouse:scroll-down  (set by gctl)\n"
+        "mouse:scroll-down  (last set by gctl)\n"
     );
     assert_eq!(
         ok(
@@ -1569,7 +1569,7 @@ fn scroll_records_both_scroll_binds_of_every_profile() {
             dir.path(),
             &["get", "bind", "scroll-down", "--profile", "3"]
         ),
-        "mouse:scroll-up  (set by gctl)\n"
+        "mouse:scroll-up  (last set by gctl)\n"
     );
 }
 
@@ -1597,7 +1597,7 @@ fn a_scroll_bind_clears_the_scroll_memory() {
             dir.path(),
             &["get", "bind", "scroll-up", "--profile", "1"]
         ),
-        "mouse:scroll-up  (set by gctl)\n"
+        "mouse:scroll-up  (last set by gctl)\n"
     );
     assert_eq!(
         ok(
@@ -1605,7 +1605,7 @@ fn a_scroll_bind_clears_the_scroll_memory() {
             dir.path(),
             &["get", "bind", "scroll-down", "--profile", "3"]
         ),
-        "mouse:scroll-up  (set by gctl)\n",
+        "mouse:scroll-up  (last set by gctl)\n",
         "the other scroll binds stay remembered"
     );
 }
@@ -1636,7 +1636,7 @@ fn a_new_stage_count_drops_that_profiles_dpi_colours() {
     assert_eq!(ok(&mouse, dir.path(), &["get", "dpi-colors"]), "unknown\n");
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "dpi-colors", "--profile", "1"]),
-        "ffff00 0000ff ff0000  (set by gctl)\n",
+        "ffff00 0000ff ff0000  (last set by gctl)\n",
         "another profile keeps its colours"
     );
 }
@@ -1653,7 +1653,7 @@ fn the_same_stage_count_keeps_the_dpi_colours() {
     ok(&mouse, dir.path(), &["set", "dpi", "800", "1600", "3200"]);
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "dpi-colors"]),
-        "ffff00 0000ff ff0000  (set by gctl)\n"
+        "ffff00 0000ff ff0000  (last set by gctl)\n"
     );
 }
 
@@ -1946,12 +1946,12 @@ fn an_exported_profile_imports_back_with_its_memory() {
         &["import", path.to_str().unwrap(), "--yes"],
     );
     for (args, expected) in [
-        (&["get", "scroll"][..], "invert  (set by gctl)\n"),
-        (&["get", "effect"][..], "wave rate=40  (set by gctl)\n"),
-        (&["get", "brightness"][..], "200 50  (set by gctl)\n"),
+        (&["get", "scroll"][..], "invert  (last set by gctl)\n"),
+        (&["get", "effect"][..], "wave rate=40  (last set by gctl)\n"),
+        (&["get", "brightness"][..], "200 50  (last set by gctl)\n"),
         (
             &["get", "bind", "back"][..],
-            "key:ctrl+KeyA  (set by gctl)\n",
+            "key:ctrl+KeyA  (last set by gctl)\n",
         ),
     ] {
         assert_eq!(ok(&mouse, fresh.path(), args), expected, "{args:?}");
@@ -2025,7 +2025,7 @@ fn import_writes_into_the_given_profile() {
     );
     assert_eq!(
         ok(&mouse, dir.path(), &["get", "effect", "--profile", "3"]),
-        "solid 00ff00  (set by gctl)\n"
+        "solid 00ff00  (last set by gctl)\n"
     );
 }
 
@@ -2330,27 +2330,27 @@ fn an_import_records_each_remembered_setting_on_its_own() {
         (
             "[profile]\neffect = \"solid 00ff00\"\n",
             &["get", "effect"][..],
-            "solid 00ff00  (set by gctl)\n",
+            "solid 00ff00  (last set by gctl)\n",
         ),
         (
             "[profile.binds]\nback = \"mouse:forward\"\n",
             &["get", "bind", "back"][..],
-            "mouse:forward  (set by gctl)\n",
+            "mouse:forward  (last set by gctl)\n",
         ),
         (
             "[device]\nbrightness = { wired = 10, wireless = 20 }\n",
             &["get", "brightness"][..],
-            "10 20  (set by gctl)\n",
+            "10 20  (last set by gctl)\n",
         ),
         (
             "[device]\nscroll = \"default\"\n",
             &["get", "scroll"][..],
-            "default  (set by gctl)\n",
+            "default  (last set by gctl)\n",
         ),
         (
             "[profile]\ndpi_colors = [\"112233\", \"445566\", \"778899\"]\n",
             &["get", "dpi-colors"][..],
-            "112233 445566 778899  (set by gctl)\n",
+            "112233 445566 778899  (last set by gctl)\n",
         ),
         (
             "[profile]\ndpi = [400, 800]\n",

@@ -292,7 +292,7 @@ fn get_all<T: Transport>(
 /// A write-only value as the CLI prints it: marked when remembered.
 fn write_only(value: Option<&str>) -> String {
     match value {
-        Some(value) => format!("{value}  (set by gctl)"),
+        Some(value) => format!("{value}  (last set by gctl)"),
         None => "unknown".to_owned(),
     }
 }

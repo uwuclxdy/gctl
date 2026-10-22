@@ -291,6 +291,7 @@ fn confirming_an_import_runs_it_on_the_edited_profile() {
     assert!(state.update(Msg::Tick).is_empty());
     state.update(Msg::Imported {
         error: None,
+        reached: false,
         written: Vec::new(),
         remembered: None,
         snapshot: Some(Ok(snapshot())),
@@ -589,6 +590,7 @@ fn a_write_whose_reread_hits_a_dead_handle_reopens_the_device() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: Vec::new(),
+            reached: true,
         }),
         remembered: None,
         snapshot: Err(LoadError::Transport(
@@ -617,6 +619,7 @@ fn an_import_whose_reread_hits_a_dead_handle_reopens_the_device() {
     })));
     state.update(Msg::Imported {
         error: Some("HID transport failed: gone".to_owned()),
+        reached: true,
         written: Vec::new(),
         remembered: None,
         snapshot: Some(Err(LoadError::Transport(
@@ -635,6 +638,7 @@ fn a_write_that_fails_on_a_live_handle_keeps_it() {
         error: Some(WriteFailure {
             message: "device is asleep".to_owned(),
             landed: Vec::new(),
+            reached: false,
         }),
         remembered: None,
         snapshot: Err(LoadError::Asleep),
@@ -1047,6 +1051,7 @@ fn a_failed_apply_shows_the_error_and_keeps_what_did_not_land_pending() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: Vec::new(),
+            reached: true,
         }),
         remembered: None,
         snapshot: Ok(fresh),
@@ -1068,6 +1073,7 @@ fn an_apply_whose_reload_finds_the_mouse_asleep_keeps_the_edits() {
         error: Some(WriteFailure {
             message: "device is asleep".to_owned(),
             landed: Vec::new(),
+            reached: false,
         }),
         remembered: None,
         snapshot: Err(LoadError::Asleep),
@@ -1607,10 +1613,12 @@ fn a_revert_forgets_which_fields_were_edited() {
 }
 
 // The stage list, the active stage and the stage colours are one edited unit:
-// the first DPI edit captures all three, and reloads never move any of them.
+// the first DPI edit captures the list and the colours, and reloads never move
+// them. The active stage is the entry's only once the user picks one; until
+// then it follows the latest read, clamped to the entry's list.
 
 #[test]
-fn the_dpi_unit_keeps_its_active_stage_over_an_outside_change() {
+fn an_unpicked_active_stage_past_the_shorter_list_is_the_last_stage() {
     let mut state = ready(snapshot());
     edit(&mut state, Edit::RemoveStage(2));
     state.update(Msg::Tick);
@@ -1694,6 +1702,7 @@ fn a_write_failure_shows_above_the_memory_refusal() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: Vec::new(),
+            reached: true,
         }),
         remembered: None,
         snapshot: Ok(memory_unreadable()),
@@ -1739,6 +1748,7 @@ fn an_import_failure_shows_once_as_a_notice() {
     })));
     state.update(Msg::Imported {
         error: Some("device is asleep".to_owned()),
+        reached: false,
         written: Vec::new(),
         remembered: None,
         snapshot: Some(Ok(snapshot())),
@@ -1831,6 +1841,7 @@ fn a_failed_apply_keeps_its_fields_edited() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: Vec::new(),
+            reached: true,
         }),
         remembered: None,
         snapshot: Ok(snapshot()),
@@ -1958,6 +1969,7 @@ fn an_import_after_an_applied_colour_shows_the_imported_colour() {
     })));
     state.update(Msg::Imported {
         error: None,
+        reached: false,
         written: Vec::new(),
         remembered: None,
         snapshot: Some(Ok(Snapshot {
@@ -1981,6 +1993,7 @@ fn a_failed_import_ends_no_edit() {
     })));
     state.update(Msg::Imported {
         error: Some("device is asleep".to_owned()),
+        reached: false,
         written: Vec::new(),
         remembered: None,
         snapshot: Some(Ok(Snapshot {
@@ -2024,6 +2037,7 @@ fn a_queued_import_question_holds_the_line_until_it_is_answered() {
     assert!(state.update(Msg::Apply).is_empty());
     state.update(Msg::Imported {
         error: None,
+        reached: false,
         written: Vec::new(),
         remembered: None,
         snapshot: Some(Ok(snapshot())),
@@ -2049,6 +2063,7 @@ fn an_import_that_never_started_shows_its_failure_once() {
     let message = "cannot list HID devices: gone".to_owned();
     state.update(Msg::Imported {
         error: Some(message.clone()),
+        reached: false,
         written: Vec::new(),
         remembered: None,
         snapshot: None,
@@ -2099,6 +2114,7 @@ fn import_then(state: &mut State, written: Vec<WriteOp>, after: Snapshot) {
     })));
     state.update(Msg::Imported {
         error: None,
+        reached: false,
         written,
         remembered: None,
         snapshot: Some(Ok(after)),
@@ -2299,6 +2315,7 @@ fn import_landed(state: &mut State, written: Vec<WriteOp>, reread: Result<Snapsh
     );
     state.update(Msg::Imported {
         error: None,
+        reached: false,
         written,
         remembered: None,
         snapshot: Some(reread),
@@ -2394,6 +2411,7 @@ fn a_good_reread_after_a_failed_write_ends_the_entries_a_landed_write_left() {
         error: Some(WriteFailure {
             message: "the mouse refused the profile".to_owned(),
             landed: Vec::new(),
+            reached: true,
         }),
         remembered: None,
         snapshot: Ok(Snapshot {
@@ -2432,6 +2450,7 @@ fn an_edit_back_while_an_import_runs_keeps_the_entry() {
     edit(&mut state, Edit::Debounce(10));
     state.update(Msg::Imported {
         error: None,
+        reached: false,
         written: vec![WriteOp::Debounce(debounce(4))],
         remembered: None,
         snapshot: Some(Ok(Snapshot {
@@ -2459,6 +2478,7 @@ fn an_edit_back_while_an_import_runs_ends_an_entry_the_import_does_not_write() {
     assert!(!state.pending(Section::Performance));
     state.update(Msg::Imported {
         error: None,
+        reached: false,
         written: vec![WriteOp::PollingRate(PollingRate::Hz500)],
         remembered: None,
         snapshot: Some(Ok(Snapshot {
@@ -2876,6 +2896,7 @@ fn a_failed_apply_ends_the_entries_its_landed_ops_carried() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+            reached: true,
         }),
         remembered: None,
         snapshot: Err(transport_error()),
@@ -2906,6 +2927,7 @@ fn a_failed_apply_with_a_good_reread_ends_the_entries_its_landed_ops_carried() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+            reached: true,
         }),
         remembered: None,
         snapshot: Ok(Snapshot {
@@ -2937,6 +2959,7 @@ fn a_failed_import_ends_the_entries_its_landed_ops_carried() {
     })));
     state.update(Msg::Imported {
         error: Some("HID transport failed: gone".to_owned()),
+        reached: true,
         written: vec![WriteOp::PollingRate(PollingRate::Hz500)],
         remembered: None,
         snapshot: Some(Err(transport_error())),
@@ -3080,6 +3103,7 @@ fn a_failed_effect_write_whose_reread_failed_shows_what_memory_holds() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: Vec::new(),
+            reached: true,
         }),
         remembered: Some(Ok(Memory::default())),
         snapshot: Err(transport_error()),
@@ -3133,6 +3157,7 @@ fn a_failed_stage_count_change_whose_reread_failed_drops_the_colours() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: Vec::new(),
+            reached: true,
         }),
         remembered: Some(Ok(Memory::default())),
         snapshot: Err(transport_error()),
@@ -3174,6 +3199,7 @@ fn an_edit_back_during_a_write_whose_op_failed_ends_at_the_answer() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+            reached: true,
         }),
         remembered: None,
         snapshot: Err(transport_error()),
@@ -3204,6 +3230,7 @@ fn an_edit_back_during_an_import_whose_op_failed_ends_at_the_answer() {
     edit(&mut state, Edit::Debounce(10));
     state.update(Msg::Imported {
         error: Some("HID transport failed: gone".to_owned()),
+        reached: true,
         written: vec![WriteOp::PollingRate(PollingRate::Hz500)],
         remembered: None,
         snapshot: Some(Err(transport_error())),
@@ -3228,6 +3255,7 @@ fn a_failed_write_whose_reread_shows_its_value_ends_the_entry() {
         error: Some(WriteFailure {
             message: "HID transport failed: gone".to_owned(),
             landed: Vec::new(),
+            reached: true,
         }),
         remembered: None,
         snapshot: Ok(Snapshot {
@@ -3333,6 +3361,7 @@ fn a_pick_during_an_import_is_refused_even_with_pending_edits() {
     assert_eq!(state.prompt(), None);
     state.update(Msg::Imported {
         error: None,
+        reached: false,
         written: vec![WriteOp::Debounce(debounce(3))],
         remembered: None,
         snapshot: Some(Ok(Snapshot {
@@ -3389,6 +3418,7 @@ fn an_edit_back_during_an_import_that_never_reached_the_mouse_ends_at_the_answer
     edit(&mut state, Edit::Debounce(10));
     state.update(Msg::Imported {
         error: Some("no Glorious mouse found".to_owned()),
+        reached: false,
         written: Vec::new(),
         remembered: None,
         snapshot: None,
@@ -3426,4 +3456,1493 @@ fn text_typed_after_ticking_never_is_dropped() {
     assert_eq!(state.sleep_minutes(), Some("2".to_owned()));
     assert_eq!(state.sleep_seconds(), Some("0".to_owned()));
     assert!(!state.pending(Section::Performance));
+}
+
+// --- other writers (gui.md §Behaviour "other writers") ----------------------
+// B: a value the mouse moved under a pending entry is a footer line in its own
+//    slot beside the notice; the entry stays.
+// C: an unpicked active stage follows the latest read into Apply.
+// D: a readable value no write of this window explains raises the banner.
+
+fn reload(state: &mut State, snap: Snapshot) {
+    state.update(Msg::Tick);
+    state.update(Msg::Loaded(Ok(snap)));
+}
+
+fn lines(items: &[&str]) -> Vec<String> {
+    items.iter().map(|line| (*line).to_owned()).collect()
+}
+
+#[test]
+fn an_outside_change_under_an_edit_keeps_the_edit_and_says_so() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert_eq!(
+        state.changed(),
+        lines(&["polling rate changed on the mouse to 250 Hz; your edit is kept"])
+    );
+    assert_eq!(state.polling_rate(), Some(PollingRate::Hz500));
+    assert_eq!(
+        state.plan(Section::Performance),
+        Ok(vec![WriteOp::PollingRate(PollingRate::Hz500)])
+    );
+    // a later read that moves nothing leaves the notice, like any notice
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert_eq!(
+        state.changed(),
+        lines(&["polling rate changed on the mouse to 250 Hz; your edit is kept"])
+    );
+}
+
+#[test]
+fn every_moved_edited_field_gets_its_own_line_in_row_order() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::Debounce(4));
+    edit(&mut state, Edit::SleepMinutes("5".to_owned()));
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    edit(&mut state, Edit::DpiText(0, "500".to_owned()));
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            sleep: SleepDelay::Seconds(90),
+            debounce: Debounce::new(7).unwrap(),
+            dpi: stages(&[400, 800, 3200]),
+            ..snapshot()
+        },
+    );
+    assert_eq!(
+        state.changed(),
+        lines(&[
+            "DPI stages changed on the mouse to 400 800 3200; your edit is kept",
+            "polling rate changed on the mouse to 250 Hz; your edit is kept",
+            "debounce changed on the mouse to 7 ms; your edit is kept",
+            "sleep changed on the mouse to 1m30s; your edit is kept",
+        ])
+    );
+    assert_eq!(
+        state.stage_texts(),
+        Some(vec!["500".to_owned(), "800".to_owned(), "1600".to_owned()])
+    );
+    assert_eq!(state.debounce(), Some(4));
+}
+
+#[test]
+fn a_lift_off_moved_under_its_edit_names_its_millimetres() {
+    let mut state = ready(Snapshot {
+        lift_off: LiftOff::Mm2,
+        ..snapshot()
+    });
+    edit(&mut state, Edit::LiftOff(LiftOff::Mm1));
+    edit(&mut state, Edit::SleepNever(true));
+    reload(
+        &mut state,
+        Snapshot {
+            lift_off: LiftOff::Mm1,
+            sleep: SleepDelay::Never,
+            ..snapshot()
+        },
+    );
+    assert_eq!(
+        state.changed(),
+        lines(&[
+            "lift-off changed on the mouse to 1 mm; your edit is kept",
+            "sleep changed on the mouse to never; your edit is kept",
+        ])
+    );
+}
+
+#[test]
+fn the_mouse_moving_a_picked_active_stage_says_so() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::ActiveStage(3));
+    reload(
+        &mut state,
+        Snapshot {
+            dpi_stage: DpiStage::new(1).unwrap(),
+            ..snapshot()
+        },
+    );
+    assert_eq!(
+        state.changed(),
+        lines(&["active stage changed on the mouse to 1; your edit is kept"])
+    );
+    assert_eq!(state.active_stage(), Some(3));
+    assert_eq!(
+        state.plan(Section::Performance),
+        Ok(vec![WriteOp::DpiStage(DpiStage::new(3).unwrap())])
+    );
+}
+
+#[test]
+fn a_moved_field_nobody_edited_is_no_notice() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::Debounce(4));
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert!(state.changed().is_empty());
+}
+
+#[test]
+fn a_read_that_moves_nothing_under_an_edit_is_no_notice() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    reload(&mut state, snapshot());
+    assert!(state.changed().is_empty());
+}
+
+#[test]
+fn a_write_answer_showing_its_own_value_is_no_notice() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    edit(&mut state, Edit::Debounce(4));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: None,
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            polling_rate: PollingRate::Hz500,
+            debounce: Debounce::new(4).unwrap(),
+            ..snapshot()
+        }),
+    });
+    assert!(state.changed().is_empty());
+    assert!(!state.pending(Section::Performance));
+}
+
+#[test]
+fn the_dpi_button_under_an_unpicked_stage_is_no_notice() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::DpiText(0, "500".to_owned()));
+    reload(
+        &mut state,
+        Snapshot {
+            dpi_stage: DpiStage::new(3).unwrap(),
+            ..snapshot()
+        },
+    );
+    assert!(state.changed().is_empty());
+    assert_eq!(state.active_stage(), Some(3));
+}
+
+#[test]
+fn a_stage_list_apply_writes_the_stage_the_dpi_button_picked() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::DpiText(0, "500".to_owned()));
+    reload(
+        &mut state,
+        Snapshot {
+            dpi_stage: DpiStage::new(3).unwrap(),
+            ..snapshot()
+        },
+    );
+    assert_eq!(
+        state.update(Msg::Apply),
+        vec![Request::Apply {
+            profile: profile(2),
+            ops: vec![
+                WriteOp::Dpi(stages(&[500, 800, 1600])),
+                WriteOp::DpiStage(DpiStage::new(3).unwrap()),
+            ],
+        }]
+    );
+}
+
+#[test]
+fn a_colour_apply_keeps_the_stage_the_dpi_button_picked() {
+    let mut state = ready(Snapshot {
+        dpi_colors: Some(vec![rgb("ff0000"), rgb("00ff00"), rgb("0000ff")]),
+        ..snapshot()
+    });
+    edit(&mut state, Edit::StageColor(0, rgb("123456")));
+    reload(
+        &mut state,
+        Snapshot {
+            dpi_stage: DpiStage::new(3).unwrap(),
+            dpi_colors: Some(vec![rgb("ff0000"), rgb("00ff00"), rgb("0000ff")]),
+            ..snapshot()
+        },
+    );
+    assert_eq!(state.active_stage(), Some(3));
+    // the colours alone: no stage write, so the mouse stays on stage 3
+    assert_eq!(
+        state.update(Msg::Apply),
+        vec![Request::Apply {
+            profile: profile(2),
+            ops: vec![WriteOp::DpiColors(vec![
+                rgb("123456"),
+                rgb("00ff00"),
+                rgb("0000ff"),
+            ])],
+        }]
+    );
+}
+
+#[test]
+fn an_unpicked_stage_follows_the_mouse_after_the_list_shrinks() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::RemoveStage(0));
+    // the mouse's stage 2 still fits the two-stage entry
+    assert_eq!(state.active_stage(), Some(2));
+    reload(
+        &mut state,
+        Snapshot {
+            dpi_stage: DpiStage::new(1).unwrap(),
+            ..snapshot()
+        },
+    );
+    assert_eq!(state.active_stage(), Some(1));
+    assert_eq!(
+        state.plan(Section::Performance),
+        Ok(vec![
+            WriteOp::Dpi(stages(&[800, 1600])),
+            WriteOp::DpiStage(DpiStage::new(1).unwrap()),
+        ])
+    );
+}
+
+#[test]
+fn a_readable_value_another_program_moved_raises_the_banner() {
+    let cases = [
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+        Snapshot {
+            lift_off: LiftOff::Mm2,
+            ..snapshot()
+        },
+        Snapshot {
+            sleep: SleepDelay::Never,
+            ..snapshot()
+        },
+        Snapshot {
+            firmware: Firmware([0, 3, 9, 0]),
+            ..snapshot()
+        },
+        Snapshot {
+            dpi: stages(&[400, 800, 3200]),
+            ..snapshot()
+        },
+        Snapshot {
+            debounce: Debounce::new(7).unwrap(),
+            ..snapshot()
+        },
+    ];
+    for case in cases {
+        let mut state = ready(snapshot());
+        assert!(!state.outside_change(), "the first read compares nothing");
+        reload(&mut state, case.clone());
+        assert!(state.outside_change(), "{case:?}");
+    }
+}
+
+#[test]
+fn the_mouse_own_buttons_and_the_battery_never_raise_the_banner() {
+    let mut state = ready(snapshot());
+    reload(
+        &mut state,
+        Snapshot {
+            dpi_stage: DpiStage::new(3).unwrap(),
+            active: profile(1),
+            battery: Battery {
+                state: DeviceState::Awake,
+                percent: Some(20),
+            },
+            ..snapshot()
+        },
+    );
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn this_windows_own_write_never_raises_the_banner() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    edit(&mut state, Edit::DpiText(0, "500".to_owned()));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: None,
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            polling_rate: PollingRate::Hz500,
+            dpi: stages(&[500, 800, 1600]),
+            ..snapshot()
+        }),
+    });
+    assert!(!state.outside_change());
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz500,
+            dpi: stages(&[500, 800, 1600]),
+            ..snapshot()
+        },
+    );
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn a_write_answer_showing_another_change_raises_the_banner() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: None,
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            polling_rate: PollingRate::Hz500,
+            lift_off: LiftOff::Mm2,
+            ..snapshot()
+        }),
+    });
+    assert!(state.outside_change());
+}
+
+#[test]
+fn a_write_whose_reread_failed_is_explained_at_the_next_read() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: None,
+        remembered: None,
+        snapshot: Err(LoadError::Transport("gone".to_owned())),
+    });
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz500,
+            ..snapshot()
+        },
+    );
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn a_partial_write_explains_the_ops_that_landed() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    edit(&mut state, Edit::Debounce(4));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "HID transport failed: gone".to_owned(),
+            landed: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+            reached: true,
+        }),
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            polling_rate: PollingRate::Hz500,
+            ..snapshot()
+        }),
+    });
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn an_import_never_raises_the_banner_for_what_it_wrote() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Import(import_path()));
+    let writes = vec![WriteOp::Debounce(Debounce::new(4).unwrap())];
+    assert_eq!(
+        state
+            .update(Msg::ImportChecked(Ok(ImportCheck {
+                note: None,
+                device_wide: false,
+                writes: writes.clone(),
+            })))
+            .len(),
+        1
+    );
+    state.update(Msg::Imported {
+        error: None,
+        reached: false,
+        written: writes,
+        remembered: None,
+        snapshot: Some(Ok(Snapshot {
+            debounce: Debounce::new(4).unwrap(),
+            ..snapshot()
+        })),
+    });
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn a_change_made_while_the_mouse_was_away_raises_the_banner() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Tick);
+    state.update(Msg::Loaded(Err(LoadError::NoMouse)));
+    reload(
+        &mut state,
+        Snapshot {
+            lift_off: LiftOff::Mm2,
+            ..snapshot()
+        },
+    );
+    assert!(state.outside_change());
+}
+
+#[test]
+fn another_profile_compares_only_the_device_wide_values() {
+    let mut state = ready(snapshot());
+    assert_eq!(
+        state.update(Msg::PickProfile(profile(1))),
+        vec![Request::Load(Some(profile(1)))]
+    );
+    state.update(Msg::Loaded(Ok(Snapshot {
+        profile: profile(1),
+        dpi: stages(&[1200]),
+        dpi_stage: DpiStage::new(1).unwrap(),
+        debounce: Debounce::new(4).unwrap(),
+        ..snapshot()
+    })));
+    assert!(!state.outside_change());
+
+    let mut state = ready(snapshot());
+    state.update(Msg::PickProfile(profile(1)));
+    state.update(Msg::Loaded(Ok(Snapshot {
+        profile: profile(1),
+        polling_rate: PollingRate::Hz250,
+        ..snapshot()
+    })));
+    assert!(state.outside_change());
+}
+
+#[test]
+fn another_model_never_raises_the_banner() {
+    let mut state = ready(snapshot());
+    reload(
+        &mut state,
+        Snapshot {
+            model: Model::from_pid(0x2012).unwrap(),
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn dismiss_clears_the_banner_until_the_next_unexplained_change() {
+    let mut state = ready(snapshot());
+    let moved_rate = Snapshot {
+        polling_rate: PollingRate::Hz250,
+        ..snapshot()
+    };
+    reload(&mut state, moved_rate.clone());
+    assert!(state.outside_change());
+    assert!(state.update(Msg::DismissOutsideChange).is_empty());
+    assert!(!state.outside_change());
+    reload(&mut state, moved_rate);
+    assert!(!state.outside_change(), "the 250 Hz was already seen");
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz125,
+            ..snapshot()
+        },
+    );
+    assert!(state.outside_change());
+}
+
+#[test]
+fn the_banner_stays_through_a_reconnect_writes_and_reads() {
+    let mut state = ready(snapshot());
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    state.update(Msg::Tick);
+    state.update(Msg::Loaded(Err(LoadError::NoMouse)));
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert!(state.outside_change());
+    state.update(Msg::Select(Section::Lighting));
+    edit(&mut state, Edit::Effect(EffectKind::Wave));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: None,
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        }),
+    });
+    assert!(state.outside_change(), "only Dismiss clears it");
+}
+
+// --- other writers, review round 1 ----------------------------------------------
+
+#[test]
+fn a_failed_import_keeps_its_notice_beside_the_moved_lines() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    state.update(Msg::Import(import_path()));
+    assert_eq!(
+        state
+            .update(Msg::ImportChecked(Ok(ImportCheck {
+                note: None,
+                device_wide: false,
+                writes: vec![WriteOp::Debounce(Debounce::new(4).unwrap())],
+            })))
+            .len(),
+        1
+    );
+    state.update(Msg::Imported {
+        error: Some("HID transport failed: gone".to_owned()),
+        reached: true,
+        written: Vec::new(),
+        remembered: None,
+        snapshot: Some(Ok(Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        })),
+    });
+    assert_eq!(
+        state.notice(),
+        Some(&Notice::Failed("HID transport failed: gone".to_owned()))
+    );
+    assert_eq!(
+        state.changed(),
+        lines(&["polling rate changed on the mouse to 250 Hz; your edit is kept"])
+    );
+}
+
+#[test]
+fn a_successful_import_keeps_its_notice_beside_the_moved_lines() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    state.update(Msg::Import(import_path()));
+    let writes = vec![WriteOp::Debounce(Debounce::new(4).unwrap())];
+    state.update(Msg::ImportChecked(Ok(ImportCheck {
+        note: None,
+        device_wide: false,
+        writes: writes.clone(),
+    })));
+    state.update(Msg::Imported {
+        error: None,
+        reached: false,
+        written: writes,
+        remembered: None,
+        snapshot: Some(Ok(Snapshot {
+            polling_rate: PollingRate::Hz250,
+            debounce: Debounce::new(4).unwrap(),
+            ..snapshot()
+        })),
+    });
+    assert_eq!(
+        state.notice(),
+        Some(&Notice::Done("imported into profile 2".to_owned()))
+    );
+    assert_eq!(
+        state.changed(),
+        lines(&["polling rate changed on the mouse to 250 Hz; your edit is kept"])
+    );
+}
+
+#[test]
+fn the_next_user_action_clears_the_moved_lines_like_a_notice() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert_eq!(state.changed().len(), 1);
+    edit(&mut state, Edit::Debounce(4));
+    assert!(state.changed().is_empty());
+}
+
+#[test]
+fn a_dpi_write_that_failed_inside_the_list_owns_the_stage_reset() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::DpiText(0, "500".to_owned()));
+    edit(&mut state, Edit::ActiveStage(3));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    // the failing `Dpi` op wrote active stage 1 before its list report failed
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "HID transport failed: gone".to_owned(),
+            landed: Vec::new(),
+            reached: true,
+        }),
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            dpi_stage: DpiStage::new(1).unwrap(),
+            ..snapshot()
+        }),
+    });
+    assert!(state.changed().is_empty());
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn a_dpi_list_that_reached_the_mouse_before_its_failure_is_this_windows_own() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::DpiText(0, "500".to_owned()));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "HID transport failed: gone".to_owned(),
+            landed: Vec::new(),
+            reached: true,
+        }),
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            dpi: stages(&[500, 800, 1600]),
+            dpi_stage: DpiStage::new(1).unwrap(),
+            ..snapshot()
+        }),
+    });
+    assert!(state.changed().is_empty());
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn a_failed_write_whose_reread_failed_owns_its_fields_at_the_next_read_only() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "HID transport failed: gone".to_owned(),
+            landed: Vec::new(),
+            reached: true,
+        }),
+        remembered: None,
+        snapshot: Err(LoadError::Transport("gone".to_owned())),
+    });
+    // the failing report did reach the mouse
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz500,
+            ..snapshot()
+        },
+    );
+    assert!(!state.outside_change());
+    // that read was good, so the next move is someone else's again
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert!(state.outside_change());
+}
+
+#[test]
+fn a_failed_write_owns_only_the_fields_it_carried() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::Debounce(4));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "HID transport failed: gone".to_owned(),
+            landed: Vec::new(),
+            reached: true,
+        }),
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            lift_off: LiftOff::Mm2,
+            ..snapshot()
+        }),
+    });
+    assert!(state.outside_change());
+}
+
+fn wired() -> Snapshot {
+    Snapshot {
+        model: Model::from_pid(0x2011).unwrap(),
+        ..snapshot()
+    }
+}
+
+#[test]
+fn a_cable_or_dongle_switch_starts_a_fresh_baseline() {
+    assert_eq!(snapshot().model.product_id, 0x2022);
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    reload(
+        &mut state,
+        Snapshot {
+            firmware: Firmware([0, 3, 9, 0]),
+            polling_rate: PollingRate::Hz250,
+            ..wired()
+        },
+    );
+    assert!(!state.outside_change());
+    assert!(state.changed().is_empty());
+    // the wired read is the new baseline
+    reload(
+        &mut state,
+        Snapshot {
+            firmware: Firmware([0, 3, 9, 0]),
+            polling_rate: PollingRate::Hz125,
+            ..wired()
+        },
+    );
+    assert!(state.outside_change());
+    assert_eq!(
+        state.changed(),
+        lines(&["polling rate changed on the mouse to 125 Hz; your edit is kept"])
+    );
+}
+
+// --- other writers, review round 2: a moved line lives only with its entry ------
+
+#[test]
+fn a_section_discard_drops_the_lines_of_the_entries_it_drops() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    state.update(Msg::Select(Section::Lighting));
+    assert!(state.prompt().is_some());
+    // the background poll still reads under the discard question
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert_eq!(
+        state.changed(),
+        lines(&["polling rate changed on the mouse to 250 Hz; your edit is kept"])
+    );
+    state.update(Msg::Discard);
+    assert_eq!(state.section(), Section::Lighting);
+    assert_eq!(state.polling_rate(), Some(PollingRate::Hz250));
+    assert!(state.changed().is_empty());
+}
+
+#[test]
+fn a_profile_discard_drops_the_lines_of_the_entries_it_drops() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    state.update(Msg::PickProfile(profile(1)));
+    assert!(state.prompt().is_some());
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert_eq!(state.changed().len(), 1);
+    state.update(Msg::Discard);
+    assert!(state.changed().is_empty());
+}
+
+#[test]
+fn another_model_drops_the_lines_with_the_entries() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert_eq!(state.changed().len(), 1);
+    reload(
+        &mut state,
+        Snapshot {
+            model: Model::from_pid(0x2012).unwrap(),
+            ..snapshot()
+        },
+    );
+    assert!(!state.pending(Section::Performance));
+    assert!(state.changed().is_empty());
+}
+
+#[test]
+fn an_import_that_never_reached_the_mouse_owns_no_field() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Import(import_path()));
+    state.update(Msg::ImportChecked(Ok(ImportCheck {
+        note: None,
+        device_wide: false,
+        writes: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+    })));
+    // `snapshot: None`: the import never opened the mouse, so wrote nothing
+    state.update(Msg::Imported {
+        error: Some("no Glorious mouse found".to_owned()),
+        reached: false,
+        written: Vec::new(),
+        remembered: None,
+        snapshot: None,
+    });
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert!(state.outside_change());
+}
+
+// --- other writers, review round 3: every line ends with its own entry ----------
+
+/// Edit, open the discard question, let the background read move the field,
+/// then Discard: the line shows while the entry lives and ends with it.
+fn discard_ends_the_line(edits: &[Edit], moved: Snapshot, expected: &[&str]) {
+    let mut state = ready(snapshot());
+    for e in edits {
+        state.update(Msg::Edit(e.clone()));
+    }
+    state.update(Msg::Select(Section::Lighting));
+    assert!(state.prompt().is_some(), "the discard question is open");
+    reload(&mut state, moved);
+    let want: Vec<String> = expected.iter().map(|s| (*s).to_owned()).collect();
+    assert_eq!(
+        state.changed(),
+        want,
+        "the line shows while its entry lives"
+    );
+    state.update(Msg::Discard);
+    assert!(
+        state.changed().is_empty(),
+        "lines left after Discard: {:?}",
+        state.changed()
+    );
+}
+
+#[test]
+fn the_active_stage_line_lives_with_the_dpi_entry() {
+    discard_ends_the_line(
+        &[Edit::ActiveStage(3)],
+        Snapshot {
+            dpi_stage: DpiStage::new(1).unwrap(),
+            ..snapshot()
+        },
+        &["active stage changed on the mouse to 1; your edit is kept"],
+    );
+}
+
+#[test]
+fn the_dpi_list_line_lives_with_the_dpi_entry() {
+    discard_ends_the_line(
+        &[Edit::DpiText(0, "500".to_owned())],
+        Snapshot {
+            dpi: stages(&[400, 900, 1600]),
+            ..snapshot()
+        },
+        &["DPI stages changed on the mouse to 400 900 1600; your edit is kept"],
+    );
+}
+
+#[test]
+fn the_lift_off_line_lives_with_its_entry() {
+    discard_ends_the_line(
+        &[Edit::LiftOff(LiftOff::Mm2)],
+        Snapshot {
+            lift_off: LiftOff::Mm2,
+            ..snapshot()
+        },
+        &["lift-off changed on the mouse to 2 mm; your edit is kept"],
+    );
+}
+
+#[test]
+fn the_debounce_line_lives_with_its_entry() {
+    discard_ends_the_line(
+        &[Edit::Debounce(0)],
+        Snapshot {
+            debounce: Debounce::new(7).unwrap(),
+            ..snapshot()
+        },
+        &["debounce changed on the mouse to 7 ms; your edit is kept"],
+    );
+}
+
+#[test]
+fn the_sleep_line_lives_with_its_entry() {
+    discard_ends_the_line(
+        &[Edit::SleepMinutes("5".to_owned())],
+        Snapshot {
+            sleep: SleepDelay::Seconds(60),
+            ..snapshot()
+        },
+        &["sleep changed on the mouse to 1m; your edit is kept"],
+    );
+}
+
+/// Every field at once, ended by a model change (no user message between).
+#[test]
+fn another_model_ends_every_line_at_once() {
+    let other: &'static Model = MODELS.iter().find(|m| m.name != MODELS[0].name).unwrap();
+    let mut state = ready(snapshot());
+    for e in [
+        Edit::DpiText(0, "500".to_owned()),
+        Edit::ActiveStage(3),
+        Edit::PollingRate(PollingRate::Hz500),
+        Edit::LiftOff(LiftOff::Mm2),
+        Edit::Debounce(0),
+        Edit::SleepMinutes("5".to_owned()),
+    ] {
+        state.update(Msg::Edit(e));
+    }
+    reload(
+        &mut state,
+        Snapshot {
+            dpi: stages(&[400, 900, 1600]),
+            dpi_stage: DpiStage::new(1).unwrap(),
+            polling_rate: PollingRate::Hz250,
+            lift_off: LiftOff::Mm2,
+            debounce: Debounce::new(7).unwrap(),
+            sleep: SleepDelay::Seconds(60),
+            ..snapshot()
+        },
+    );
+    assert_eq!(state.changed().len(), 6, "{:?}", state.changed());
+    reload(
+        &mut state,
+        Snapshot {
+            model: other,
+            ..snapshot()
+        },
+    );
+    assert!(
+        state.changed().is_empty(),
+        "lines left: {:?}",
+        state.changed()
+    );
+}
+
+/// A write's answer ends the entry it carried and keeps the line of a live
+/// entry it did not carry.
+#[test]
+fn a_write_answer_ends_its_own_entry_and_keeps_another_live_line() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Edit(Edit::PollingRate(PollingRate::Hz500)));
+    // the mouse moves to the edit's value: the entry lives, nothing pending
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz500,
+            ..snapshot()
+        },
+    );
+    assert!(!state.pending(Section::Performance));
+    state.update(Msg::Edit(Edit::LiftOff(LiftOff::Mm2)));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: None,
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            polling_rate: PollingRate::Hz250,
+            lift_off: LiftOff::Mm2,
+            ..snapshot()
+        }),
+    });
+    assert_eq!(
+        state.changed(),
+        vec!["polling rate changed on the mouse to 250 Hz; your edit is kept".to_owned()]
+    );
+    assert_eq!(state.lift_off(), Some(LiftOff::Mm2));
+    assert!(state.outside_change());
+}
+
+/// An import that reached the mouse but whose re-read failed still owns the
+/// fields its check carried until the next good read.
+#[test]
+fn an_import_whose_reread_failed_still_owns_its_fields() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Import(import_path()));
+    state.update(Msg::ImportChecked(Ok(ImportCheck {
+        note: None,
+        device_wide: false,
+        writes: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+    })));
+    state.update(Msg::Imported {
+        error: Some("HID transport failed: gone".to_owned()),
+        reached: true,
+        written: Vec::new(),
+        remembered: None,
+        snapshot: Some(Err(LoadError::Asleep)),
+    });
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz500,
+            ..snapshot()
+        },
+    );
+    assert!(!state.outside_change());
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert!(state.outside_change());
+}
+
+/// The never-reached import keeps an earlier failed Apply's unsure fields: it
+/// marks nothing and clears nothing.
+#[test]
+fn a_never_reached_import_keeps_an_earlier_failed_writes_fields() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Edit(Edit::PollingRate(PollingRate::Hz500)));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "HID transport failed: gone".to_owned(),
+            landed: Vec::new(),
+            reached: true,
+        }),
+        remembered: None,
+        snapshot: Err(LoadError::Asleep),
+    });
+    state.update(Msg::Revert);
+    state.update(Msg::Import(import_path()));
+    state.update(Msg::ImportChecked(Ok(ImportCheck {
+        note: None,
+        device_wide: false,
+        writes: vec![WriteOp::Debounce(Debounce::new(4).unwrap())],
+    })));
+    state.update(Msg::Imported {
+        error: Some("no Glorious mouse found".to_owned()),
+        reached: false,
+        written: Vec::new(),
+        remembered: None,
+        snapshot: None,
+    });
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz500,
+            ..snapshot()
+        },
+    );
+    assert!(!state.outside_change());
+}
+
+/// A read that moves only a field nobody edited leaves the earlier line of a
+/// live entry alone.
+#[test]
+fn a_move_under_no_entry_keeps_an_earlier_live_line() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Edit(Edit::LiftOff(LiftOff::Mm2)));
+    reload(
+        &mut state,
+        Snapshot {
+            lift_off: LiftOff::Mm2,
+            ..snapshot()
+        },
+    );
+    let line = vec!["lift-off changed on the mouse to 2 mm; your edit is kept".to_owned()];
+    assert_eq!(state.changed(), line);
+    reload(
+        &mut state,
+        Snapshot {
+            lift_off: LiftOff::Mm2,
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert_eq!(state.changed(), line);
+}
+
+/// A failed DPI write whose list report landed while the picked stage did not:
+/// the entry lives (picked 3, mouse 1), and the list is this window's own.
+#[test]
+fn a_failed_list_write_that_landed_under_a_live_entry_is_no_line() {
+    let mut state = ready(snapshot());
+    state.update(Msg::Edit(Edit::DpiText(0, "500".to_owned())));
+    state.update(Msg::Edit(Edit::ActiveStage(3)));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "HID transport failed: gone".to_owned(),
+            landed: Vec::new(),
+            reached: true,
+        }),
+        remembered: None,
+        snapshot: Ok(Snapshot {
+            dpi: stages(&[500, 800, 1600]),
+            dpi_stage: DpiStage::new(1).unwrap(),
+            ..snapshot()
+        }),
+    });
+    assert!(
+        state.pending(Section::Performance),
+        "the picked stage keeps the entry alive"
+    );
+    assert!(state.changed().is_empty(), "lines: {:?}", state.changed());
+    assert!(!state.outside_change());
+}
+
+// --- other writers, review round 4: a write owns only what it may have sent -------
+
+#[test]
+fn an_apply_that_never_reached_the_mouse_owns_no_field() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::PollingRate(PollingRate::Hz500));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "no Glorious mouse found".to_owned(),
+            landed: Vec::new(),
+            reached: false,
+        }),
+        remembered: None,
+        snapshot: Err(LoadError::NoMouse),
+    });
+    reload(
+        &mut state,
+        Snapshot {
+            polling_rate: PollingRate::Hz250,
+            ..snapshot()
+        },
+    );
+    assert!(state.outside_change());
+    assert_eq!(
+        state.changed(),
+        lines(&["polling rate changed on the mouse to 250 Hz; your edit is kept"])
+    );
+}
+
+#[test]
+fn an_apply_refused_by_the_awake_check_owns_no_field() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::Debounce(4));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "device is asleep".to_owned(),
+            landed: Vec::new(),
+            reached: false,
+        }),
+        remembered: None,
+        snapshot: Err(LoadError::Asleep),
+    });
+    reload(
+        &mut state,
+        Snapshot {
+            debounce: Debounce::new(7).unwrap(),
+            ..snapshot()
+        },
+    );
+    assert!(state.outside_change());
+    assert_eq!(
+        state.changed(),
+        lines(&["debounce changed on the mouse to 7 ms; your edit is kept"])
+    );
+}
+
+#[test]
+fn an_apply_that_failed_on_its_first_report_owns_that_field() {
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::Debounce(4));
+    assert_eq!(state.update(Msg::Apply).len(), 1);
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "HID transport failed: gone".to_owned(),
+            landed: Vec::new(),
+            reached: true,
+        }),
+        remembered: None,
+        snapshot: Err(LoadError::Transport("gone".to_owned())),
+    });
+    reload(
+        &mut state,
+        Snapshot {
+            debounce: Debounce::new(4).unwrap(),
+            ..snapshot()
+        },
+    );
+    assert!(!state.outside_change());
+}
+
+// --- other writers, review round 5: the mouse refused before the report ----------
+
+#[test]
+fn a_stage_pick_the_mouse_refused_before_its_report_shows_the_outside_shrink() {
+    // Another program shrank the list to 2 stages after the last read; the
+    // pick of stage 3 is refused before its report, and the answer's re-read
+    // carries the shrink.
+    let mut state = ready(snapshot());
+    edit(&mut state, Edit::ActiveStage(3));
+    assert_eq!(
+        state.update(Msg::Apply),
+        vec![Request::Apply {
+            profile: profile(2),
+            ops: vec![WriteOp::DpiStage(DpiStage::new(3).unwrap())],
+        }]
+    );
+    state.update(Msg::Applied {
+        error: Some(WriteFailure {
+            message: "DPI stage 3 is out of range 1..=2".to_owned(),
+            landed: Vec::new(),
+            reached: false,
+        }),
+        snapshot: Ok(Snapshot {
+            dpi: stages(&[400, 800]),
+            dpi_stage: DpiStage::new(1).unwrap(),
+            ..snapshot()
+        }),
+        remembered: None,
+    });
+    assert!(state.outside_change());
+    assert_eq!(
+        state.changed(),
+        lines(&[
+            "DPI stages changed on the mouse to 400 800; your edit is kept",
+            "active stage changed on the mouse to 1; your edit is kept",
+        ])
+    );
+}
+
+// --- other writers, review rounds 6-7: an import's failing op and its re-read -----
+
+const UNPLUGGED: &str = "HID transport failed: device unplugged";
+
+/// A running import of `[PollingRate(500), Dpi(400 800)]` into profile 2.
+fn import_running() -> State {
+    let mut state = ready(snapshot());
+    state.update(Msg::Import(import_path()));
+    state.update(Msg::ImportChecked(Ok(ImportCheck {
+        note: None,
+        device_wide: true,
+        writes: vec![
+            WriteOp::PollingRate(PollingRate::Hz500),
+            WriteOp::Dpi(stages(&[400, 800])),
+        ],
+    })));
+    assert_eq!(state.update(Msg::ImportConfirm).len(), 1);
+    state
+}
+
+/// The polling write landed, then the `Dpi` pre-read lost the mouse: the
+/// failing op sent nothing, and the import's re-read fails the same way.
+fn polling_landed_then_unplugged() -> State {
+    let mut state = import_running();
+    state.update(Msg::Imported {
+        error: Some(UNPLUGGED.to_owned()),
+        reached: false,
+        written: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+        snapshot: Some(Err(LoadError::Transport(UNPLUGGED.to_owned()))),
+        remembered: Some(Ok(Memory::default())),
+    });
+    state
+}
+
+#[test]
+fn an_import_whose_dpi_pre_read_failed_after_its_polling_write_landed_keeps_that_write() {
+    let mut state = polling_landed_then_unplugged();
+    assert_eq!(
+        state.snapshot().map(|snap| snap.polling_rate),
+        Some(PollingRate::Hz500),
+        "the landed write applies to the snapshot at once"
+    );
+    assert!(state.reopen(), "a transport error re-opens the mouse");
+    // the next poll reads this window's own polling write and nothing else
+    state.update(Msg::Loaded(Ok(Snapshot {
+        polling_rate: PollingRate::Hz500,
+        ..snapshot()
+    })));
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn an_import_whose_memory_save_failed_after_every_op_landed_keeps_its_writes() {
+    let mut state = import_running();
+    let read = Snapshot {
+        polling_rate: PollingRate::Hz500,
+        dpi: stages(&[400, 800]),
+        dpi_stage: DpiStage::new(1).unwrap(),
+        ..snapshot()
+    };
+    state.update(Msg::Imported {
+        error: Some("cannot save memory".to_owned()),
+        reached: false,
+        written: vec![
+            WriteOp::PollingRate(PollingRate::Hz500),
+            WriteOp::Dpi(stages(&[400, 800])),
+        ],
+        snapshot: Some(Ok(read.clone())),
+        remembered: None,
+    });
+    assert!(!state.outside_change());
+    state.update(Msg::Loaded(Ok(read)));
+    assert!(!state.outside_change());
+}
+
+#[test]
+fn an_outside_move_after_an_import_that_sent_its_failing_op_nothing_still_raises() {
+    let mut state = polling_landed_then_unplugged();
+    state.update(Msg::Loaded(Ok(Snapshot {
+        polling_rate: PollingRate::Hz250,
+        ..snapshot()
+    })));
+    assert!(state.outside_change());
+}
+
+/// The polling write landed, the `Dpi` op failed, and the re-read shows a DPI
+/// list another program wrote meanwhile.
+fn polling_landed_then_dpi_failed(reached: bool) -> State {
+    let mut state = import_running();
+    state.update(Msg::Imported {
+        error: Some(UNPLUGGED.to_owned()),
+        reached,
+        written: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+        snapshot: Some(Ok(Snapshot {
+            polling_rate: PollingRate::Hz500,
+            dpi: stages(&[400, 3200]),
+            ..snapshot()
+        })),
+        remembered: None,
+    });
+    state
+}
+
+#[test]
+fn an_import_whose_failing_op_sent_nothing_owns_no_field_on_its_re_read() {
+    let state = polling_landed_then_dpi_failed(false);
+    assert!(
+        state.outside_change(),
+        "the DPI list moved and no report of this import explains it"
+    );
+}
+
+#[test]
+fn an_import_whose_failing_op_sent_a_report_owns_its_fields_on_its_re_read() {
+    let state = polling_landed_then_dpi_failed(true);
+    assert!(
+        !state.outside_change(),
+        "the failing DPI report may have landed"
+    );
+}
+
+/// A pick of profile 3 whose read failed keeps profile 2's snapshot hidden;
+/// an import into profile 3 lands `written`, and its re-read fails too.
+fn import_into_a_picked_profile_whose_read_failed(written: Vec<WriteOp>) -> State {
+    let mut state = ready(snapshot());
+    assert_eq!(state.update(Msg::Tick).len(), 1);
+    assert!(state.update(Msg::PickProfile(profile(3))).is_empty());
+    assert_eq!(state.update(Msg::Loaded(Ok(snapshot()))).len(), 1);
+    state.update(Msg::Loaded(Err(LoadError::Failed(
+        "HID transport failed: no response".to_owned(),
+    ))));
+    state.update(Msg::Import(import_path()));
+    let requests = state.update(Msg::ImportChecked(Ok(ImportCheck {
+        note: None,
+        device_wide: false,
+        writes: written.clone(),
+    })));
+    assert!(
+        matches!(requests.as_slice(), [Request::Import { profile: p, .. }] if *p == profile(3)),
+        "the import writes profile 3: {requests:?}"
+    );
+    state.update(Msg::Imported {
+        error: None,
+        reached: false,
+        written,
+        snapshot: Some(Err(LoadError::Failed(
+            "HID transport failed: no response".to_owned(),
+        ))),
+        remembered: Some(Ok(Memory::default())),
+    });
+    state
+}
+
+#[test]
+fn an_import_into_another_profile_never_patches_the_hidden_profiles_dpi() {
+    let mut state =
+        import_into_a_picked_profile_whose_read_failed(vec![WriteOp::Dpi(stages(&[400, 800]))]);
+    assert_eq!(state.update(Msg::PickProfile(profile(2))).len(), 1);
+    state.update(Msg::Loaded(Ok(snapshot())));
+    assert!(
+        !state.outside_change(),
+        "profile 3's DPI write was patched into profile 2's baseline"
+    );
+}
+
+#[test]
+fn an_import_into_another_profile_still_patches_its_device_wide_writes() {
+    let mut state = import_into_a_picked_profile_whose_read_failed(vec![WriteOp::PollingRate(
+        PollingRate::Hz500,
+    )]);
+    assert_eq!(state.update(Msg::PickProfile(profile(2))).len(), 1);
+    state.update(Msg::Loaded(Ok(Snapshot {
+        polling_rate: PollingRate::Hz500,
+        ..snapshot()
+    })));
+    assert!(
+        !state.outside_change(),
+        "the polling rate is every profile's: this window's own write explains it"
+    );
+}
+
+#[test]
+fn an_import_into_another_profile_never_patches_the_hidden_profiles_debounce() {
+    let mut state = import_into_a_picked_profile_whose_read_failed(vec![WriteOp::Debounce(
+        Debounce::new(4).unwrap(),
+    )]);
+    assert_eq!(state.update(Msg::PickProfile(profile(2))).len(), 1);
+    state.update(Msg::Loaded(Ok(snapshot())));
+    assert!(
+        !state.outside_change(),
+        "profile 3's debounce write was patched into profile 2's baseline"
+    );
+}
+
+#[test]
+fn picking_back_after_an_import_into_another_profile_shows_only_its_own_values() {
+    let mut state = import_into_a_picked_profile_whose_read_failed(vec![
+        WriteOp::Dpi(stages(&[400, 800])),
+        WriteOp::DpiStage(DpiStage::new(1).unwrap()),
+        WriteOp::Debounce(Debounce::new(4).unwrap()),
+    ]);
+    assert_eq!(state.update(Msg::PickProfile(profile(2))).len(), 1);
+    // profile 2's read has not landed yet: the panes show its kept snapshot
+    assert_eq!(
+        state.stage_texts(),
+        Some(vec!["400".to_owned(), "800".to_owned(), "1600".to_owned()])
+    );
+    assert_eq!(
+        state.active_stage(),
+        Some(2),
+        "profile 3's stage shows on profile 2"
+    );
+    assert_eq!(
+        state.debounce(),
+        Some(10),
+        "profile 3's debounce shows on profile 2"
+    );
 }

@@ -77,12 +77,14 @@ pub(crate) fn apply<T: Transport>(
     check_awake(device).map_err(|error| WriteFailure {
         message: render(error),
         landed: Vec::new(),
+        reached: false,
     })?;
     crate::writes::apply(device, state_dir, profile, ops)
         .map(|_| ())
         .map_err(|failure| WriteFailure {
             message: render(failure.error),
             landed: failure.landed,
+            reached: failure.reached,
         })
 }
 
@@ -138,10 +140,12 @@ pub(crate) fn run_import<T: Transport>(
         prepare_confirmed(device, profile, path, confirmed).map_err(|message| WriteFailure {
             message,
             landed: Vec::new(),
+            reached: false,
         })?;
     crate::import::execute_landed(device, state_dir, prepared).map_err(|failure| WriteFailure {
         message: render(failure.error),
         landed: failure.landed,
+        reached: failure.reached,
     })
 }
 

@@ -603,3 +603,74 @@ fn every_action_button_hugs_its_label() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The footer's last text (its notice lines, else Revert and Apply) ends this
+/// close to the window's bottom edge when the footer is pinned there.
+const FOOTER_REACH: f32 = 40.0;
+
+/// Performance with the outside-change banner and two moved lines under it:
+/// the tallest footer and the tallest chrome the window draws.
+fn banner_and_lines() -> Shell {
+    let mut machine = State::new().0;
+    machine.update(Msg::Loaded(Ok(snapshot())));
+    machine.update(Msg::Edit(Edit::PollingRate(PollingRate::Hz500)));
+    machine.update(Msg::Edit(Edit::Debounce(4)));
+    machine.update(Msg::Tick);
+    machine.update(Msg::Loaded(Ok(Snapshot {
+        polling_rate: PollingRate::Hz250,
+        debounce: gctl_proto::Debounce::new(7).unwrap(),
+        ..snapshot()
+    })));
+    assert!(machine.outside_change());
+    assert_eq!(machine.changed().len(), 2);
+    shell_with_machine(machine)
+}
+
+/// At the window's shipped size, every pane with a footer keeps Revert, Apply
+/// and the moved lines inside the window, pinned to its bottom edge: the cards
+/// scroll, the footer never does (gui.md §Behaviour).
+#[test]
+fn the_footer_stays_pinned_inside_the_shipped_window_on_every_pane() {
+    let height = window_settings().size.height;
+    let mut cases: Vec<(String, Shell)> = panes()
+        .into_iter()
+        .filter(|(_, section, _)| *section != Section::Device)
+        .map(|(name, _, shell)| (name, shell))
+        .collect();
+    cases.push((
+        "Performance banner and lines".to_owned(),
+        banner_and_lines(),
+    ));
+    let mut wrong = Vec::new();
+    for (case, shell) in &cases {
+        let placed = texts(shell);
+        let footer: Vec<&Placed> = placed
+            .iter()
+            .filter(|p| {
+                p.content == "Revert"
+                    || p.content == "Apply"
+                    || p.content.contains("changed on the mouse to")
+            })
+            .collect();
+        let has = |content: &str| footer.iter().any(|p| p.content == content);
+        if !has("Revert") || !has("Apply") {
+            wrong.push(format!("{case}: no Revert or Apply"));
+            continue;
+        }
+        let bottom = footer
+            .iter()
+            .map(|p| p.bounds.y + p.bounds.height)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if bottom > height + SLACK || bottom < height - FOOTER_REACH {
+            wrong.push(format!(
+                "{case}: the footer ends at {bottom:.1} in a {height} tall window"
+            ));
+        }
+    }
+    let lines = texts(&cases[cases.len() - 1].1)
+        .into_iter()
+        .filter(|p| p.content.contains("changed on the mouse to"))
+        .count();
+    assert!(lines >= 1, "the moved lines are drawn");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

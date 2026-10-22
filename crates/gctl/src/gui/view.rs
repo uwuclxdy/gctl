@@ -51,7 +51,14 @@ enum Message {
         error: Option<String>,
         /// The writes that landed, on failure too.
         written: Vec<WriteOp>,
-        /// `None` when the import never reached the mouse.
+        /// The import's failing op handed at least one write report to the
+        /// transport; `false` on success and on every failure before any
+        /// report.
+        reached: bool,
+        /// `None` when `io::run_import` never ran under the lock (no mouse, a
+        /// failed open, a lock failure): an import that ran always re-reads. A
+        /// task that died after it may have reached the mouse answers
+        /// `Some(Err(..))`.
         snapshot: Option<Result<Snapshot, LoadError>>,
         /// The memory re-loaded after the write, when the re-read failed.
         remembered: Option<Result<Memory, String>>,
@@ -139,6 +146,7 @@ impl Shell {
                 device,
                 error,
                 written,
+                reached,
                 snapshot,
                 remembered,
             } => {
@@ -146,6 +154,7 @@ impl Shell {
                 let requests = self.machine.update(Msg::Imported {
                     error,
                     written,
+                    reached,
                     snapshot,
                     remembered,
                 });
@@ -216,12 +225,16 @@ impl Shell {
     /// Runs one device transaction off the UI thread: re-opens the handle when
     /// the state asks or none is held, runs `work` on the blocking pool, emits
     /// `Msg::LockWait` if another gctl holds the lock, and answers with `map`.
-    /// Every transaction shares this one helper, so the re-open policy and the
-    /// wait bridge cannot drift between them.
+    /// `no_mouse` answers when no mouse is found; `failed` an open failure, so
+    /// the mouse was never reached; `lost` a blocking task that died (a panic
+    /// or cancel) after `work` may already have reached the mouse. Every
+    /// transaction shares this one helper, so the re-open policy and the wait
+    /// bridge cannot drift between them.
     fn device_task<T>(
         &mut self,
         no_mouse: impl Fn() -> T + Send + 'static,
         failed: impl Fn(String) -> T + Send + 'static,
+        lost: impl Fn(String) -> T + Send + 'static,
         work: impl FnOnce(&DeviceHandle, &mpsc::UnboundedSender<Message>) -> T + Send + 'static,
         map: impl Fn(Option<DeviceHandle>, T) -> Message + Send + 'static,
     ) -> Task<Message>
@@ -251,8 +264,10 @@ impl Shell {
             .await;
             let message = match outcome {
                 Ok((device, Ok(payload))) => map(device, payload),
+                // The open failed: the mouse was never reached.
                 Ok((device, Err(message))) => map(device, failed(message)),
-                Err(error) => map(None, failed(error)),
+                // The blocking task died: `work` may already have sent reports.
+                Err(error) => map(None, lost(error)),
             };
             let _ = tx.unbounded_send(message);
         })
@@ -294,6 +309,7 @@ impl Shell {
         self.device_task(
             || Err(LoadError::NoMouse),
             |message| Err(LoadError::Failed(message)),
+            |message| Err(LoadError::Failed(message)),
             move |device, sender| {
                 let guard = lock_device(device);
                 reload(
@@ -317,21 +333,14 @@ impl Shell {
                     Some(WriteFailure {
                         message: "no mouse found".to_owned(),
                         landed: Vec::new(),
+                        reached: false,
                     }),
                     Err(LoadError::NoMouse),
                     None,
                 )
             },
-            |message| {
-                (
-                    Some(WriteFailure {
-                        message: message.clone(),
-                        landed: Vec::new(),
-                    }),
-                    Err(LoadError::Failed(message)),
-                    None,
-                )
-            },
+            |message| failed_write(message, false),
+            |message| failed_write(message, true),
             move |device, sender| {
                 let error = {
                     let guard = lock_device(device);
@@ -343,6 +352,7 @@ impl Shell {
                         Err(message) => Some(WriteFailure {
                             message,
                             landed: Vec::new(),
+                            reached: false,
                         }),
                     }
                 };
@@ -381,21 +391,14 @@ impl Shell {
                     Some(WriteFailure {
                         message: "no mouse found".to_owned(),
                         landed: Vec::new(),
+                        reached: false,
                     }),
                     Err(LoadError::NoMouse),
                     None,
                 )
             },
-            |message| {
-                (
-                    Some(WriteFailure {
-                        message: message.clone(),
-                        landed: Vec::new(),
-                    }),
-                    Err(LoadError::Failed(message)),
-                    None,
-                )
-            },
+            |message| failed_write(message, false),
+            |message| failed_write(message, true),
             move |device, sender| {
                 let error = {
                     let guard = lock_device(device);
@@ -403,9 +406,18 @@ impl Shell {
                         io::make_active(&guard, profile)
                     }) {
                         Ok(Ok(())) => None,
-                        Ok(Err(message)) | Err(message) => Some(WriteFailure {
+                        // `io::make_active` fails before its one report on the
+                        // awake check and after it on the profile write; the
+                        // plan carries no ops, so either value marks nothing.
+                        Ok(Err(message)) => Some(WriteFailure {
                             message,
                             landed: Vec::new(),
+                            reached: true,
+                        }),
+                        Err(message) => Some(WriteFailure {
+                            message,
+                            landed: Vec::new(),
+                            reached: false,
                         }),
                     }
                 };
@@ -441,6 +453,7 @@ impl Shell {
         self.device_task(
             || Err("no mouse found".to_owned()),
             Err,
+            Err,
             move |device, sender| {
                 let path = match std::path::absolute(&path) {
                     Ok(path) => path,
@@ -465,40 +478,70 @@ impl Shell {
         let state_dir = self.state_dir.clone();
         let lock_path = self.lock_path.clone();
         self.device_task(
-            || (Some("no mouse found".to_owned()), Vec::new(), None, None),
-            |message| (Some(message.clone()), Vec::new(), None, None),
+            || {
+                (
+                    Some("no mouse found".to_owned()),
+                    Vec::new(),
+                    false,
+                    None,
+                    None,
+                )
+            },
+            |message| (Some(message.clone()), Vec::new(), false, None, None),
+            // The task died after it may have reached the mouse: the import is
+            // reached-but-failed, so its check's fields stay this window's own.
+            |message| {
+                (
+                    Some(message.clone()),
+                    Vec::new(),
+                    true,
+                    Some(Err(LoadError::Failed(message))),
+                    None,
+                )
+            },
             move |device, sender| {
-                let (error, written) = {
+                // Once `io::run_import` ran under the lock, the answer always
+                // re-reads: the re-read carries the saved memory, the link
+                // state and the next baseline. `reached` reports only whether
+                // the failing op handed a write report to the transport, which
+                // decides the check's fields' ownership.
+                let (error, written, reached, ran) = {
                     let guard = lock_device(device);
                     match io::with_lock(lock_path.as_deref(), wait(sender), || {
                         io::run_import(&guard, state_dir.as_deref(), profile, &path, &check)
                     }) {
-                        Ok(Ok(written)) => (None, written),
-                        Ok(Err(failure)) => (Some(failure.message), failure.landed),
-                        Err(message) => (Some(message), Vec::new()),
+                        // Every write report went out and none failed.
+                        Ok(Ok(written)) => (None, written, false, true),
+                        Ok(Err(failure)) => {
+                            (Some(failure.message), failure.landed, failure.reached, true)
+                        }
+                        // The lock was never taken: nothing was written.
+                        Err(message) => (Some(message), Vec::new(), false, false),
                     }
                 };
-                let snapshot = {
+                let snapshot = if ran {
                     let guard = lock_device(device);
-                    reload(
+                    Some(reload(
                         &guard,
                         state_dir.as_deref(),
                         lock_path.as_deref(),
                         sender,
                         Some(profile),
-                    )
-                };
-                let remembered = if snapshot.is_ok() {
-                    None
+                    ))
                 } else {
-                    Some(io::read_memory(state_dir.as_deref()))
+                    None
                 };
-                (error, written, Some(snapshot), remembered)
+                let remembered = match &snapshot {
+                    Some(Err(_)) => Some(io::read_memory(state_dir.as_deref())),
+                    Some(Ok(_)) | None => None,
+                };
+                (error, written, reached, snapshot, remembered)
             },
-            |device, (error, written, snapshot, remembered)| Message::Imported {
+            |device, (error, written, reached, snapshot, remembered)| Message::Imported {
                 device,
                 error,
                 written,
+                reached,
                 snapshot,
                 remembered,
             },
@@ -515,6 +558,29 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|error| format!("device task failed: {error}"))
+}
+
+/// One Apply-shaped answer: the failure, the re-read, and the memory re-loaded
+/// when the re-read failed.
+type AppliedAnswer = (
+    Option<WriteFailure>,
+    Result<Snapshot, LoadError>,
+    Option<Result<Memory, String>>,
+);
+
+/// An Apply-shaped answer for a failure that carried no landed ops: the open
+/// failed (no report sent, `reached` false), or the blocking task died after it
+/// may have sent one (`reached` true).
+fn failed_write(message: String, reached: bool) -> AppliedAnswer {
+    (
+        Some(WriteFailure {
+            message: message.clone(),
+            landed: Vec::new(),
+            reached,
+        }),
+        Err(LoadError::Failed(message)),
+        None,
+    )
 }
 
 /// Opens the mouse, refreshing the device list first. `Ok(None)` is "no mouse".
@@ -669,9 +735,33 @@ impl Shell {
                 .width(Length::Fill)
                 .padding([8.0, 12.0])
         });
+        let outside_banner = machine.outside_change().then(|| {
+            container(
+                row![
+                    ui_text(
+                        "The mouse was changed outside this window. Values marked \"Last set by gctl\" may be out of date."
+                    )
+                    .size(13)
+                    .color(t.warning),
+                    space().width(Length::Fill),
+                    button(control_label("Dismiss"))
+                        .style(theme::warning_button(scheme))
+                        .height(CONTROL_HEIGHT)
+                        .on_press(Message::Machine(Msg::DismissOutsideChange)),
+                ]
+                .spacing(12)
+                .align_y(iced::Alignment::Center),
+            )
+            .style(theme::banner_warning(scheme))
+            .width(Length::Fill)
+            .padding([8.0, 12.0])
+        });
         let content = self.content_pane(scheme);
         let mut page = column![];
         if let Some(banner) = error_banner {
+            page = page.push(banner);
+        }
+        if let Some(banner) = outside_banner {
             page = page.push(banner);
         }
         page = page.push(row![self.sidebar(scheme), content].height(Length::Fill));
@@ -887,6 +977,7 @@ impl Shell {
                 .size(13)
                 .color(scheme.tokens().danger_text),
         });
+        let changed = moved_lines(machine, scheme);
         let reason = blocked.map(|reason| {
             ui_text(capitalize(&reason))
                 .size(13)
@@ -904,9 +995,16 @@ impl Shell {
         if let Some(notice) = notice {
             footer = footer.push(notice);
         }
+        if let Some(changed) = changed {
+            footer = footer.push(changed);
+        }
         let footer = footer.padding([12, 16]);
+        // The cards take the height the pinned footer leaves over; the footer
+        // never scrolls out of the shipped window.
         column![
-            scrollable(container(body).padding([12, 16])).style(theme::scrollable(scheme)),
+            scrollable(container(body).padding([12, 16]))
+                .style(theme::scrollable(scheme))
+                .height(Length::Fill),
             footer
         ]
         .into()
@@ -1685,6 +1783,7 @@ impl Shell {
             Notice::Done(message) => ui_text(capitalize(message)).size(13).color(t.success),
             Notice::Failed(message) => ui_text(capitalize(message)).size(13).color(t.danger_text),
         });
+        let changed = moved_lines(machine, scheme);
         let reason = blocked.map(|reason| ui_text(capitalize(&reason)).size(13).color(t.text_3));
 
         let mouse_card = card(
@@ -1754,6 +1853,9 @@ impl Shell {
         if let Some(notice) = notice {
             profile_body = profile_body.push(notice);
         }
+        if let Some(changed) = changed {
+            profile_body = profile_body.push(changed);
+        }
         let profile_card = card(
             scheme,
             "Profile file",
@@ -1791,6 +1893,21 @@ fn capitalize(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The moved lines, one warning-tone widget in their own slot under the
+/// notice: the footer's, and the Device pane's profile card. `None` when the
+/// last read moved nothing under a live entry.
+fn moved_lines(machine: &State, scheme: Scheme) -> Option<iced::widget::Text<'static>> {
+    let lines = machine.changed();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(
+        ui_text(capitalize(&lines.join("\n")))
+            .size(13)
+            .color(scheme.tokens().warning),
+    )
 }
 
 /// Body text in the UI font.

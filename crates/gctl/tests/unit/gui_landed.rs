@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 
 use gctl_proto::{
-    Debounce, Device, Effect, MODELS, PollingRate, Profile, Report, Transport, TransportError,
+    Debounce, Device, Dpi, DpiStages, Effect, MODELS, PollingRate, Profile, Report, Transport,
+    TransportError,
 };
 
 use super::*;
@@ -22,6 +23,9 @@ struct Mouse {
     /// Writes with index `>= fail_after_writes` fail, so `1` fails the second
     /// write mid-sequence.
     fail_after_writes: Cell<usize>,
+    /// Reads already received, so a read at index `>= fail_after_reads` fails.
+    reads: Cell<usize>,
+    fail_after_reads: Cell<usize>,
 }
 
 impl Mouse {
@@ -30,6 +34,8 @@ impl Mouse {
             replies: RefCell::default(),
             sent: RefCell::default(),
             fail_after_writes: Cell::new(usize::MAX),
+            reads: Cell::new(0),
+            fail_after_reads: Cell::new(usize::MAX),
         };
         mouse.reply(0x00, 0x83, &[(1, 0xA1), (8, 35)]);
         mouse
@@ -66,6 +72,11 @@ impl Transport for Mouse {
     }
 
     fn receive(&self, report: &mut Report) -> Result<(), TransportError> {
+        let reads = self.reads.get();
+        self.reads.set(reads + 1);
+        if reads >= self.fail_after_reads.get() {
+            return Err("read refused by the fake".into());
+        }
         let key = self.sent.borrow().last().map_or((0, 0), |r| (r[5], r[6]));
         *report = self.replies.borrow().get(&key).copied().unwrap_or([0; 65]);
         Ok(())
@@ -115,6 +126,7 @@ fn a_failed_apply_reports_the_ops_that_landed_before_the_failure() {
         Err(WriteFailure {
             message: MESSAGE.to_owned(),
             landed: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+            reached: true,
         })
     );
     assert_eq!(mouse.writes().len(), 1);
@@ -130,6 +142,7 @@ fn a_failed_memory_branch_apply_reports_the_landed_ops() {
         Err(WriteFailure {
             message: MESSAGE.to_owned(),
             landed: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+            reached: true,
         })
     );
     assert_eq!(mouse.writes().len(), 1);
@@ -154,6 +167,7 @@ fn a_failed_import_reports_the_ops_that_landed_before_the_failure() {
         Err(WriteFailure {
             message: MESSAGE.to_owned(),
             landed: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+            reached: true,
         })
     );
     assert_eq!(mouse.writes().len(), 1);
@@ -167,6 +181,8 @@ fn a_memory_save_failure_reports_the_whole_plan_as_landed() {
     let ops = vec![WriteOp::Effect(Effect::Off)];
     let result = apply(&device(&mouse), Some(dir.path()), profile(2), &ops);
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // No op failed, so no failing report is attributed to this failure: the
+    // landed plan explains the fields it wrote instead.
     assert_eq!(
         result,
         Err(WriteFailure {
@@ -175,6 +191,31 @@ fn a_memory_save_failure_reports_the_whole_plan_as_landed() {
                 dir.path().join("memory.toml")
             ),
             landed: ops,
+            reached: false,
         })
     );
+}
+
+/// A DPI write reads the stage count before its report; a failed read sends
+/// nothing, so the failure owns no field. The awake check's read comes first.
+#[test]
+fn a_pre_write_read_failure_owns_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mouse = Mouse::new();
+    mouse.fail_after_reads.set(1);
+    let stages = DpiStages::new(vec![Dpi::new(400).unwrap(), Dpi::new(800).unwrap()]).unwrap();
+    assert_eq!(
+        apply(
+            &device(&mouse),
+            Some(dir.path()),
+            profile(2),
+            &[WriteOp::Dpi(stages)]
+        ),
+        Err(WriteFailure {
+            message: "HID transport failed: read refused by the fake".to_owned(),
+            landed: Vec::new(),
+            reached: false,
+        })
+    );
+    assert!(mouse.writes().is_empty());
 }

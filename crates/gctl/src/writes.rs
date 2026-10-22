@@ -17,6 +17,31 @@ use crate::parse;
 pub(crate) struct WriteError {
     pub(crate) error: CmdError,
     pub(crate) landed: Vec<WriteOp>,
+    /// Whether the failing op handed at least one write report to the transport
+    /// (a report that failed counts: it may have landed); the ops that landed
+    /// before it are in `landed`. The GUI's "this window wrote it" rule reads
+    /// it; the CLI reads `error` only.
+    pub(crate) reached: bool,
+}
+
+/// A fail-fast write's error, with the ops that landed before it and whether
+/// the failing op handed at least one write report to the transport.
+#[derive(Debug)]
+pub(crate) struct WriteAttempt {
+    error: gctl_proto::Error,
+    landed: Vec<WriteOp>,
+    reached: bool,
+}
+
+/// The `reached` value of a failure with no failing operation (a memory
+/// refusal, or every op landed and the save then failed): no report is
+/// attributed to it, so it owns no field.
+const NO_FAILING_OP: bool = false;
+
+/// Whether the operation that just failed handed a write report to the
+/// transport: the count moved, even when the send itself failed.
+pub(crate) fn sent_since<T: Transport>(device: &Device<T>, before: u64) -> bool {
+    device.writes_sent() != before
 }
 
 /// The scroll binds a direction writes to the scroll-up/down buttons: invert
@@ -148,41 +173,54 @@ fn clear_op(
     }
 }
 
+/// Records a successful write's memory effect or clears a failed one's, and on
+/// failure reports whether that op's report reached the transport.
+fn finish<T: Transport>(
+    device: &Device<T>,
+    profile: Option<Profile>,
+    op: &WriteOp,
+    old_stage_count: Option<usize>,
+    before: u64,
+    result: gctl_proto::Result<()>,
+    memory: &mut Memory,
+) -> Result<(), WriteAttempt> {
+    match result {
+        Ok(()) => {
+            record_op(device.model().name, profile, op, old_stage_count, memory);
+            Ok(())
+        }
+        Err(error) => {
+            clear_op(device.model().name, profile, op, old_stage_count, memory);
+            Err(WriteAttempt {
+                error,
+                landed: Vec::new(),
+                reached: sent_since(device, before),
+            })
+        }
+    }
+}
+
 pub(crate) fn effect<T: Transport>(
     device: &Device<T>,
     profile: Profile,
     effect: &Effect,
     memory: &mut Memory,
-) -> gctl_proto::Result<()> {
+) -> Result<(), WriteAttempt> {
     let op = WriteOp::Effect(effect.clone());
-    match device.set_effect(profile, effect) {
-        Ok(()) => {
-            record_op(device.model().name, Some(profile), &op, None, memory);
-            Ok(())
-        }
-        Err(error) => {
-            clear_op(device.model().name, Some(profile), &op, None, memory);
-            Err(error)
-        }
-    }
+    let before = device.writes_sent();
+    let result = device.set_effect(profile, effect);
+    finish(device, Some(profile), &op, None, before, result, memory)
 }
 
 pub(crate) fn brightness<T: Transport>(
     device: &Device<T>,
     brightness: Brightness,
     memory: &mut Memory,
-) -> gctl_proto::Result<()> {
+) -> Result<(), WriteAttempt> {
     let op = WriteOp::Brightness(brightness);
-    match device.set_brightness(brightness) {
-        Ok(()) => {
-            record_op(device.model().name, None, &op, None, memory);
-            Ok(())
-        }
-        Err(error) => {
-            clear_op(device.model().name, None, &op, None, memory);
-            Err(error)
-        }
-    }
+    let before = device.writes_sent();
+    let result = device.set_brightness(brightness);
+    finish(device, None, &op, None, before, result, memory)
 }
 
 pub(crate) fn dpi_colors<T: Transport>(
@@ -190,18 +228,11 @@ pub(crate) fn dpi_colors<T: Transport>(
     profile: Profile,
     colors: &[Rgb],
     memory: &mut Memory,
-) -> gctl_proto::Result<()> {
+) -> Result<(), WriteAttempt> {
     let op = WriteOp::DpiColors(colors.to_vec());
-    match device.set_dpi_colors(profile, colors) {
-        Ok(()) => {
-            record_op(device.model().name, Some(profile), &op, None, memory);
-            Ok(())
-        }
-        Err(error) => {
-            clear_op(device.model().name, Some(profile), &op, None, memory);
-            Err(error)
-        }
-    }
+    let before = device.writes_sent();
+    let result = device.set_dpi_colors(profile, colors);
+    finish(device, Some(profile), &op, None, before, result, memory)
 }
 
 pub(crate) fn bind<T: Transport>(
@@ -210,36 +241,22 @@ pub(crate) fn bind<T: Transport>(
     button: Button,
     binding: Binding,
     memory: &mut Memory,
-) -> gctl_proto::Result<()> {
+) -> Result<(), WriteAttempt> {
     let op = WriteOp::Bind(button, binding);
-    match device.bind(profile, button, binding) {
-        Ok(()) => {
-            record_op(device.model().name, Some(profile), &op, None, memory);
-            Ok(())
-        }
-        Err(error) => {
-            clear_op(device.model().name, Some(profile), &op, None, memory);
-            Err(error)
-        }
-    }
+    let before = device.writes_sent();
+    let result = device.bind(profile, button, binding);
+    finish(device, Some(profile), &op, None, before, result, memory)
 }
 
 pub(crate) fn scroll<T: Transport>(
     device: &Device<T>,
     direction: ScrollDirection,
     memory: &mut Memory,
-) -> gctl_proto::Result<()> {
+) -> Result<(), WriteAttempt> {
     let op = WriteOp::Scroll(direction);
-    match device.set_scroll(direction) {
-        Ok(()) => {
-            record_op(device.model().name, None, &op, None, memory);
-            Ok(())
-        }
-        Err(error) => {
-            clear_op(device.model().name, None, &op, None, memory);
-            Err(error)
-        }
-    }
+    let before = device.writes_sent();
+    let result = device.set_scroll(direction);
+    finish(device, None, &op, None, before, result, memory)
 }
 
 /// Writes a profile's DPI stage list; when the stage count changes, that
@@ -250,27 +267,29 @@ pub(crate) fn dpi_stages<T: Transport>(
     profile: Profile,
     stages: &DpiStages,
     memory: &mut Memory,
-) -> gctl_proto::Result<()> {
-    let old_count = device.dpi(profile)?.stages.as_slice().len();
+) -> Result<(), WriteAttempt> {
+    let before = device.writes_sent();
+    let old_count = match device.dpi(profile) {
+        Ok(config) => config.stages.as_slice().len(),
+        Err(error) => {
+            return Err(WriteAttempt {
+                error,
+                landed: Vec::new(),
+                reached: sent_since(device, before),
+            });
+        }
+    };
     let result = device.set_dpi_stages(profile, stages);
     let op = WriteOp::Dpi(stages.clone());
-    match &result {
-        Ok(()) => record_op(
-            device.model().name,
-            Some(profile),
-            &op,
-            Some(old_count),
-            memory,
-        ),
-        Err(_) => clear_op(
-            device.model().name,
-            Some(profile),
-            &op,
-            Some(old_count),
-            memory,
-        ),
-    }
-    result
+    finish(
+        device,
+        Some(profile),
+        &op,
+        Some(old_count),
+        before,
+        result,
+        memory,
+    )
 }
 
 /// Runs one write, then persists its memory effect: recorded on success, the
@@ -278,30 +297,30 @@ pub(crate) fn dpi_stages<T: Transport>(
 /// on a second line; after a successful write it names the mouse as written.
 pub(crate) fn with_memory(
     state_dir: Option<&Path>,
-    write: impl FnOnce(&mut Memory) -> gctl_proto::Result<()>,
+    write: impl FnOnce(&mut Memory) -> Result<(), WriteAttempt>,
 ) -> Result<(), CmdError> {
-    with_memory_landed(state_dir, &[], |memory| match write(memory) {
-        Ok(()) => Ok(Vec::new()),
-        Err(error) => Err((error, Vec::new())),
-    })
-    .map(|_| ())
-    .map_err(|failure| failure.error)
+    with_memory_landed(state_dir, &[], |memory| write(memory).map(|()| Vec::new()))
+        .map(|_| ())
+        .map_err(|failure| failure.error)
 }
 
 /// `with_memory` with the ops a landed write reports back, so a fail-fast
-/// caller can patch its snapshot with exactly the ops that landed.
+/// caller can patch its snapshot with exactly the ops that landed. The closure
+/// also reports whether its failing op sent a write report.
 pub(crate) fn with_memory_landed(
     state_dir: Option<&Path>,
     ops: &[WriteOp],
-    write: impl FnOnce(&mut Memory) -> Result<Vec<WriteOp>, (gctl_proto::Error, Vec<WriteOp>)>,
+    write: impl FnOnce(&mut Memory) -> Result<Vec<WriteOp>, WriteAttempt>,
 ) -> Result<Vec<WriteOp>, WriteError> {
     let state_dir = memory::require_state_dir(state_dir).map_err(|error| WriteError {
         error,
         landed: Vec::new(),
+        reached: NO_FAILING_OP,
     })?;
     let mut memory = Memory::load(Some(state_dir)).map_err(|error| WriteError {
         error,
         landed: Vec::new(),
+        reached: NO_FAILING_OP,
     })?;
     match write(&mut memory) {
         Ok(landed) => match memory.save(state_dir) {
@@ -309,12 +328,18 @@ pub(crate) fn with_memory_landed(
             Err(error) => Err(WriteError {
                 error: CmdError::Message(memory::save_message(state_dir, &error, true)),
                 landed: ops.to_vec(),
+                reached: NO_FAILING_OP,
             }),
         },
-        Err((device_error, landed)) => match memory.save(state_dir) {
+        Err(WriteAttempt {
+            error: device_error,
+            landed,
+            reached,
+        }) => match memory.save(state_dir) {
             Ok(()) => Err(WriteError {
                 error: CmdError::Runtime(device_error),
                 landed,
+                reached,
             }),
             Err(error) => Err(WriteError {
                 error: CmdError::WriteThenSave {
@@ -322,6 +347,7 @@ pub(crate) fn with_memory_landed(
                     save_message: memory::save_message(state_dir, &error, false),
                 },
                 landed,
+                reached,
             }),
         },
     }
@@ -362,6 +388,23 @@ impl WriteOp {
             | WriteOp::Bind(_, _) => true,
         }
     }
+
+    /// Whether the write changes a device-wide value, one every profile shares.
+    pub(crate) fn device_wide(&self) -> bool {
+        match self {
+            WriteOp::PollingRate(_)
+            | WriteOp::LiftOff(_)
+            | WriteOp::Sleep(_)
+            | WriteOp::Brightness(_)
+            | WriteOp::Scroll(_) => true,
+            WriteOp::Dpi(_)
+            | WriteOp::DpiStage(_)
+            | WriteOp::DpiColors(_)
+            | WriteOp::Debounce(_)
+            | WriteOp::Effect(_)
+            | WriteOp::Bind(_, _) => false,
+        }
+    }
 }
 
 /// Runs the shared write path and reports the ops that landed, on success and
@@ -380,32 +423,41 @@ pub(crate) fn apply<T: Transport>(
             run_writes(device, profile, ops, memory)
         })
     } else {
-        run_writes(device, profile, ops, &mut Memory::default()).map_err(|(error, landed)| {
-            WriteError {
-                error: CmdError::from(error),
-                landed,
-            }
+        run_writes(device, profile, ops, &mut Memory::default()).map_err(|attempt| WriteError {
+            error: CmdError::from(attempt.error),
+            landed: attempt.landed,
+            reached: attempt.reached,
         })
     }
 }
 
 /// Writes each operation against the live device, updating `memory` for the
 /// write-only settings through `record_op`/`clear_op`. Fail-fast: returns the
-/// ops that landed before the first error.
+/// ops that landed before the first error; the error says whether that op's own
+/// report was handed to the transport.
 pub(crate) fn run_writes<T: Transport>(
     device: &Device<T>,
     profile: Profile,
     ops: &[WriteOp],
     memory: &mut Memory,
-) -> Result<Vec<WriteOp>, (gctl_proto::Error, Vec<WriteOp>)> {
+) -> Result<Vec<WriteOp>, WriteAttempt> {
     let mut landed = Vec::new();
     for op in ops {
+        // Taken before this op's own pre-read: an earlier op that landed is
+        // explained by `landed`, never by this failure's `reached`.
+        let before = device.writes_sent();
         // `set dpi` needs the stage count read before the write, so its colour
         // drop matches the memory's rule exactly.
         let old_stage_count = match op {
             WriteOp::Dpi(_) => match device.dpi(profile) {
                 Ok(config) => Some(config.stages.as_slice().len()),
-                Err(error) => return Err((error, landed)),
+                Err(error) => {
+                    return Err(WriteAttempt {
+                        error,
+                        landed,
+                        reached: sent_since(device, before),
+                    });
+                }
             },
             _ => None,
         };
@@ -441,7 +493,11 @@ pub(crate) fn run_writes<T: Transport>(
                     old_stage_count,
                     memory,
                 );
-                return Err((error, landed));
+                return Err(WriteAttempt {
+                    error,
+                    landed,
+                    reached: sent_since(device, before),
+                });
             }
         }
     }
@@ -451,3 +507,7 @@ pub(crate) fn run_writes<T: Transport>(
 #[cfg(test)]
 #[path = "../tests/unit/memory_record.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/write_attempt.rs"]
+mod attempt_tests;

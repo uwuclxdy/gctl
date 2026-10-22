@@ -178,27 +178,30 @@ pub(crate) fn execute<T: Transport>(
     execute_landed(device, state_dir, prepared).map_err(|failure| failure.error)
 }
 
+/// A refusal before the import's first write: the count says whether its
+/// failing step handed a write report over (none of these steps writes).
+fn refused<T: Transport>(device: &Device<T>, before: u64, error: CmdError) -> writes::WriteError {
+    writes::WriteError {
+        error,
+        landed: Vec::new(),
+        reached: writes::sent_since(device, before),
+    }
+}
+
 /// `execute` with the ops that landed, on success and on a fail-fast error.
 pub(crate) fn execute_landed<T: Transport>(
     device: &Device<T>,
     state_dir: Option<&Path>,
     prepared: PreparedImport,
 ) -> Result<Vec<WriteOp>, writes::WriteError> {
-    check_awake(device).map_err(|error| writes::WriteError {
-        error,
-        landed: Vec::new(),
-    })?;
-    let profile =
-        resolve_profile(device, prepared.profile).map_err(|error| writes::WriteError {
-            error,
-            landed: Vec::new(),
-        })?;
-    check_against_device(device, &prepared.path, profile, &prepared.profile_settings).map_err(
-        |error| writes::WriteError {
-            error,
-            landed: Vec::new(),
-        },
-    )?;
+    let before = device.writes_sent();
+    check_awake(device).map_err(|error| refused(device, before, error))?;
+    let before = device.writes_sent();
+    let profile = resolve_profile(device, prepared.profile)
+        .map_err(|error| refused(device, before, error))?;
+    let before = device.writes_sent();
+    check_against_device(device, &prepared.path, profile, &prepared.profile_settings)
+        .map_err(|error| refused(device, before, error))?;
     let ops = build_writes(&prepared.device_settings, &prepared.profile_settings);
     writes::apply(device, state_dir, profile, &ops)?;
     Ok(ops)

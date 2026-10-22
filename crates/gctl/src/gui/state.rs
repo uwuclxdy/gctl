@@ -241,6 +241,12 @@ pub(crate) enum Notice {
 pub(crate) struct WriteFailure {
     pub(crate) message: String,
     pub(crate) landed: Vec<WriteOp>,
+    /// Whether the failing op handed at least one write report to the transport
+    /// (a report that failed counts: it may have landed); the ops that landed
+    /// before it are in `landed`. Only then do the plan's fields count as this
+    /// window's own; a failing op that sent nothing owns nothing, even after
+    /// earlier ops landed.
+    pub(crate) reached: bool,
 }
 
 /// A message into the state machine, from the window or from a device task.
@@ -272,13 +278,23 @@ pub(crate) enum Msg {
         error: Option<String>,
         /// The writes that landed, on failure too (the ops before the failure).
         written: Vec<WriteOp>,
-        /// `None` when the import never reached the mouse (open failed, task
-        /// error), so nothing was written and nothing was re-read.
+        /// The import's failing op handed at least one write report to the
+        /// transport (the ops that landed before it are in `written`); `false`
+        /// on success and on every failure before any report. Its check's
+        /// fields count as this window's own only when this is `true` and the
+        /// answer failed.
+        reached: bool,
+        /// `None` when `io::run_import` never ran under the lock (no mouse, a
+        /// failed open, a lock failure), each with an empty `written`: an
+        /// import that ran always re-reads. A task that died after it may have
+        /// reached the mouse answers `Some(Err(..))`.
         snapshot: Option<Result<Snapshot, LoadError>>,
         /// The memory re-loaded after the write, when the device re-read failed.
         remembered: Option<Result<Memory, String>>,
     },
     LockWait,
+    /// Closes the outside-change banner; clears the flag and starts nothing.
+    DismissOutsideChange,
 }
 
 /// A device transaction the window must run off the UI thread.
@@ -352,8 +368,9 @@ struct PerformanceOverlay {
     invalid_lift_off: bool,
     debounce: Option<u8>,
     sleep: Option<SleepOverlay>,
-    /// The stage texts, active stage, colour list and per-slot hex texts are
-    /// ONE unit: the first DPI edit captures all four from the snapshot.
+    /// The stage texts, colour list and per-slot hex texts are ONE unit: the
+    /// first DPI edit captures them from the snapshot. The active stage is held
+    /// only once the user picks one.
     dpi: Option<DpiOverlay>,
 }
 
@@ -392,7 +409,9 @@ impl SleepOverlay {
 struct DpiOverlay {
     /// One text value per stage; unparsed so an invalid entry stays visible.
     texts: Vec<String>,
-    active_stage: u8,
+    /// The user's pick, held only once they make one; until then Apply writes
+    /// the latest read's stage, clamped to this entry's list.
+    active_stage: Option<u8>,
     colors: Option<Vec<Rgb>>,
     /// The typed hex per stage colour: `None` = not edited (shows the colour),
     /// `Some("")` = emptied, `Some(text)` = typed. A typed text that does not
@@ -404,10 +423,17 @@ impl DpiOverlay {
     fn from_snapshot(snap: &Snapshot) -> Self {
         Self {
             texts: stage_texts(&snap.dpi),
-            active_stage: snap.dpi_stage.get(),
+            active_stage: None,
             colors: snap.dpi_colors.clone(),
             hex: vec![None; snap.dpi.as_slice().len()],
         }
+    }
+
+    /// The stage Apply writes: the user's pick, else the latest read's stage,
+    /// clamped to the entry's stage count.
+    fn effective_stage(&self, snap: &Snapshot) -> u8 {
+        let stage = self.active_stage.unwrap_or(snap.dpi_stage.get());
+        stage.min(self.texts.len() as u8)
     }
 
     /// The typed hex for a slot, or `None` when the slot was never edited.
@@ -439,7 +465,7 @@ impl DpiOverlay {
         if parsed.as_slice() != snap.dpi.as_slice() {
             return false;
         }
-        if self.active_stage != snap.dpi_stage.get() {
+        if self.effective_stage(snap) != snap.dpi_stage.get() {
             return false;
         }
         if self.colors != snap.dpi_colors {
@@ -573,6 +599,17 @@ enum Carried {
     Scroll,
 }
 
+/// What one good snapshot moved from the baseline: the previous good snapshot
+/// with this window's landed ops applied. B draws `changed`, D reads `outside`.
+#[derive(Debug, Default)]
+struct Moved {
+    /// One line per readable field under a pending entry that moved, stored
+    /// with the entry it names so the line dies with that entry.
+    changed: Vec<(Carried, String)>,
+    /// A watched value moved that no landed op of this window explains.
+    outside: bool,
+}
+
 /// The section state machine.
 pub(crate) struct State {
     connection: Connection,
@@ -596,6 +633,16 @@ pub(crate) struct State {
     /// An import check that answered while another prompt was open; it opens
     /// once that prompt closes.
     pending_import: Option<ImportCheck>,
+    /// The lines of the last read that moved a field under a pending entry, in
+    /// their own slot under the footer's notice, each stored with the entry it
+    /// names.
+    changed: Vec<(Carried, String)>,
+    /// The fields a failed write's plan carried: its report may have reached
+    /// the mouse, so the next good read explains them instead of reporting them.
+    unsure_fields: Vec<Carried>,
+    /// A watched value moved that no write of this window explains; only
+    /// `DismissOutsideChange` clears it.
+    outside: bool,
     reopen: bool,
     waiting: bool,
 }
@@ -619,6 +666,9 @@ impl State {
                 notice: None,
                 import_path: None,
                 pending_import: None,
+                changed: Vec::new(),
+                unsure_fields: Vec::new(),
+                outside: false,
                 reopen: true,
                 waiting: false,
             },
@@ -688,6 +738,49 @@ impl State {
 
     pub(crate) fn notice(&self) -> Option<&Notice> {
         self.notice.as_ref()
+    }
+
+    /// The lines of the last read that moved a field under a pending entry, in
+    /// row order; they draw in their own slot under the footer's notice. A line
+    /// shows only while the entry it names still lives.
+    pub(crate) fn changed(&self) -> Vec<String> {
+        self.changed
+            .iter()
+            .filter(|(field, _)| self.entry_lives(*field))
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+
+    /// Whether the entry a stored moved line names is still in the overlay.
+    fn entry_lives(&self, field: Carried) -> bool {
+        let overlay = &self.overlay;
+        match field {
+            Carried::PollingRate => overlay.performance.polling_rate.is_some(),
+            Carried::LiftOff => overlay.performance.lift_off.is_some(),
+            Carried::Sleep => overlay.performance.sleep.is_some(),
+            Carried::Dpi => overlay.performance.dpi.is_some(),
+            Carried::Debounce => overlay.performance.debounce.is_some(),
+            Carried::Effect => overlay.lighting.effect.is_some(),
+            Carried::Brightness => overlay.lighting.brightness.is_some(),
+            Carried::Bind(button) => BUTTONS
+                .iter()
+                .position(|b| *b == button)
+                .is_some_and(|index| overlay.buttons.binds[index].is_some()),
+            Carried::Scroll => overlay.buttons.scroll.is_some(),
+        }
+    }
+
+    /// Clears the footer's slots for a user action: the notice and the moved
+    /// lines both start fresh.
+    fn clear_notice(&mut self) {
+        self.notice = None;
+        self.changed.clear();
+    }
+
+    /// Whether a readable value moved that no write of this window explains.
+    /// Only `DismissOutsideChange` clears it.
+    pub(crate) fn outside_change(&self) -> bool {
+        self.outside
     }
 
     /// Whether the section has pending edits: its plan is non-empty or invalid.
@@ -841,29 +934,29 @@ impl State {
     pub(crate) fn update(&mut self, message: Msg) -> Vec<Request> {
         match message {
             Msg::Edit(edit) => {
-                self.notice = None;
+                self.clear_notice();
                 self.apply_edit(edit)
             }
             Msg::Loaded(result) => self.loaded(result),
             Msg::Tick => self.tick(),
             Msg::Select(section) => {
-                self.notice = None;
+                self.clear_notice();
                 self.select(section)
             }
             Msg::PickProfile(profile) => {
-                self.notice = None;
+                self.clear_notice();
                 self.pick_profile(profile)
             }
             Msg::MakeActive => {
-                self.notice = None;
+                self.clear_notice();
                 self.make_active()
             }
             Msg::Apply => {
-                self.notice = None;
+                self.clear_notice();
                 self.apply()
             }
             Msg::Revert => {
-                self.notice = None;
+                self.clear_notice();
                 self.revert();
                 Vec::new()
             }
@@ -885,7 +978,7 @@ impl State {
                 Vec::new()
             }
             Msg::Export(path) => {
-                self.notice = None;
+                self.clear_notice();
                 self.export(path)
             }
             Msg::Exported(result) => {
@@ -898,7 +991,7 @@ impl State {
                 Vec::new()
             }
             Msg::Import(path) => {
-                self.notice = None;
+                self.clear_notice();
                 self.import(path)
             }
             Msg::ImportChecked(result) => self.import_checked(result),
@@ -907,16 +1000,21 @@ impl State {
             Msg::Imported {
                 error,
                 written,
+                reached,
                 snapshot,
                 remembered,
             } => {
-                self.imported(error, written, snapshot, remembered);
+                self.imported(error, written, reached, snapshot, remembered);
                 Vec::new()
             }
             Msg::LockWait => {
                 if self.in_flight.is_some() {
                     self.waiting = true;
                 }
+                Vec::new()
+            }
+            Msg::DismissOutsideChange => {
+                self.outside = false;
                 Vec::new()
             }
         }
@@ -933,7 +1031,7 @@ impl State {
 
     pub(crate) fn active_stage(&self) -> Option<u8> {
         if let Some(dpi) = &self.overlay.performance.dpi {
-            return Some(dpi.active_stage);
+            return self.live_snapshot().map(|snap| dpi.effective_stage(snap));
         }
         self.live_snapshot().map(|snap| snap.dpi_stage.get())
     }
@@ -1100,7 +1198,7 @@ impl State {
                     self.in_flight = Some(InFlight::Load);
                     return vec![Request::Load(self.edit_profile)];
                 }
-                self.take_snapshot(snap);
+                self.take_good(snap, &[]);
                 self.reopen = false;
             }
             Err(LoadError::NoMouse) => {
@@ -1419,10 +1517,20 @@ impl State {
             None => plan.clone(),
             Some(failure) => failure.landed.clone(),
         };
+        // A failed write's failing report may have reached the mouse: every
+        // field the plan carried is this window's own for the re-read. A
+        // failing op that sent nothing (no mouse, a failed open, a lock, a
+        // refusal before its report) owns nothing, even after earlier ops
+        // landed.
+        if error.as_ref().is_some_and(|failure| failure.reached) {
+            self.mark_unsure(&carried_fields(&plan));
+        }
         let make_active_target = self.make_active_target.take();
-        let (good, reload_error) = self.reload_result(snapshot);
+        let (good, reload_error) = self.reload_result(snapshot, &landed);
         if !good {
-            self.patch_snapshot(&landed, &remembered);
+            // A pick is refused while a write runs, so `edit_profile` is still
+            // the profile this Apply targeted.
+            self.patch_snapshot(&landed, &remembered, self.edit_profile);
         }
         self.end_carried(&carried_fields(&plan));
         if error.is_none()
@@ -1439,6 +1547,7 @@ impl State {
         &mut self,
         error: Option<String>,
         written: Vec<WriteOp>,
+        reached: bool,
         snapshot: Option<Result<Snapshot, LoadError>>,
         remembered: Option<Result<Memory, String>>,
     ) {
@@ -1453,28 +1562,35 @@ impl State {
         self.waiting = false;
         self.import_path = None;
         let carried = self.import_carried.take().unwrap_or_default();
+        // A failed import's check writes may have reached the mouse: their
+        // fields are this window's own for the re-read. Only the failing op's
+        // write report shows that; an answer without one owns nothing, though
+        // `written` still holds the ops that landed.
+        if error.is_some() && reached {
+            self.mark_unsure(&carried);
+        }
         self.notice = match &error {
             Some(message) => Some(Notice::Failed(message.clone())),
             None => import_profile
                 .map(|profile| Notice::Done(format!("imported into profile {}", profile.get()))),
         };
         match snapshot {
-            // Nothing was re-read: the failure is the notice only, but the
-            // plan-wide compare still runs against the unchanged snapshot.
+            // No re-read: `io::run_import` never ran, so the failure is the
+            // notice only. The patch and the end rule still run, as in the
+            // re-read arm.
             None => {
-                self.end_carried(&carried);
+                self.patch_snapshot(&written, &remembered, import_profile);
+                let fields = import_carried_fields(carried, &written);
+                self.end_carried(&fields);
             }
             Some(snapshot) => {
-                let (good, reload_error) = self.reload_result(snapshot);
+                let (good, reload_error) = self.reload_result(snapshot, &written);
                 if !good {
-                    self.patch_snapshot(&written, &remembered);
+                    self.patch_snapshot(&written, &remembered, import_profile);
                 }
                 // The check's writes plus the landed ops: the fields a running
                 // import carried (whose entries compare at the answer).
-                let mut fields = carried;
-                for field in carried_fields(&written) {
-                    add_field(&mut fields, field);
-                }
+                let fields = import_carried_fields(carried, &written);
                 self.end_carried(&fields);
                 // A re-read failure is a device failure for the banner; the
                 // import's own failure stays a notice.
@@ -1499,32 +1615,20 @@ impl State {
     /// Applies the ops that landed to the snapshot, so a write whose re-read
     /// failed shows its value at once. Device-readable fields come straight
     /// from the ops; the write-only half comes from the memory the write saved,
-    /// re-loaded by the answer.
-    fn patch_snapshot(&mut self, ops: &[WriteOp], remembered: &Option<Result<Memory, String>>) {
+    /// re-loaded by the answer. `profile` is the profile the write targeted: a
+    /// snapshot of another profile takes only the device-wide ops, never
+    /// another profile's values.
+    fn patch_snapshot(
+        &mut self,
+        ops: &[WriteOp],
+        remembered: &Option<Result<Memory, String>>,
+        profile: Option<Profile>,
+    ) {
         let Some(snap) = &mut self.snapshot else {
             return;
         };
-        for op in ops {
-            match op {
-                WriteOp::PollingRate(rate) => snap.polling_rate = *rate,
-                WriteOp::LiftOff(lift_off) => snap.lift_off = *lift_off,
-                WriteOp::Sleep(delay) => snap.sleep = *delay,
-                WriteOp::Debounce(debounce) => snap.debounce = *debounce,
-                WriteOp::Dpi(stages) => {
-                    snap.dpi = stages.clone();
-                    // `set_dpi_stages` resets the active stage to 1 (proto).
-                    if let Ok(stage) = DpiStage::new(1) {
-                        snap.dpi_stage = stage;
-                    }
-                }
-                WriteOp::DpiStage(stage) => snap.dpi_stage = *stage,
-                WriteOp::Brightness(_)
-                | WriteOp::Scroll(_)
-                | WriteOp::DpiColors(_)
-                | WriteOp::Effect(_)
-                | WriteOp::Bind(_, _) => {}
-            }
-        }
+        let same_profile = Some(snap.profile) == profile;
+        patch_ops(snap, ops, same_profile);
         match remembered {
             Some(Ok(memory)) => fill_write_only(snap, Some(memory), None),
             Some(Err(message)) => fill_write_only(snap, None, Some(message.clone())),
@@ -1536,10 +1640,14 @@ impl State {
     /// the re-open policy, and returns whether the re-read was a good snapshot
     /// plus the failure message for the banner (a failure that sets only the
     /// connection state has no banner message).
-    fn reload_result(&mut self, snapshot: Result<Snapshot, LoadError>) -> (bool, Option<String>) {
+    fn reload_result(
+        &mut self,
+        snapshot: Result<Snapshot, LoadError>,
+        landed: &[WriteOp],
+    ) -> (bool, Option<String>) {
         match &snapshot {
             Ok(snap) => {
-                self.take_snapshot(snap);
+                self.take_good(snap, landed);
                 self.reopen = false;
                 (true, None)
             }
@@ -1562,6 +1670,151 @@ impl State {
                 (false, Some(message.clone()))
             }
         }
+    }
+
+    /// Marks a failed write's fields as this window's own until the next good
+    /// read explains them.
+    fn mark_unsure(&mut self, fields: &[Carried]) {
+        for field in fields {
+            add_field(&mut self.unsure_fields, *field);
+        }
+    }
+
+    /// Takes a good snapshot as the next baseline after comparing it with the
+    /// old one: the moved lines and the D banner both read that one comparison.
+    /// Every path that takes a good snapshot comes through here, with the ops
+    /// this window landed since the old one.
+    fn take_good(&mut self, snap: &Snapshot, landed: &[WriteOp]) {
+        let moved = self.moved(snap, landed);
+        self.take_snapshot(snap);
+        self.unsure_fields.clear();
+        if moved.outside {
+            self.outside = true;
+        }
+        if !moved.changed.is_empty() {
+            self.changed = moved.changed;
+        }
+    }
+
+    /// The one comparison a good read makes: the new snapshot against the
+    /// baseline, the previous good snapshot with this window's landed ops
+    /// applied. Another model or link compares nothing (it becomes the next
+    /// baseline); another profile compares the device-wide values only. A field
+    /// a failed write carried is this window's own for this read.
+    fn moved(&self, snap: &Snapshot, landed: &[WriteOp]) -> Moved {
+        let Some(previous) = &self.snapshot else {
+            return Moved::default();
+        };
+        if previous.model.name != snap.model.name
+            || previous.model.product_id != snap.model.product_id
+        {
+            return Moved::default();
+        }
+        let same_profile = previous.profile == snap.profile;
+        let mut baseline = previous.clone();
+        patch_ops(&mut baseline, landed, same_profile);
+        Moved {
+            outside: (baseline.polling_rate != snap.polling_rate
+                && !self.unsure(Carried::PollingRate))
+                || (baseline.lift_off != snap.lift_off && !self.unsure(Carried::LiftOff))
+                || (baseline.sleep != snap.sleep && !self.unsure(Carried::Sleep))
+                || baseline.firmware != snap.firmware
+                || (same_profile
+                    && ((baseline.dpi != snap.dpi && !self.unsure(Carried::Dpi))
+                        || (baseline.debounce != snap.debounce
+                            && !self.unsure(Carried::Debounce)))),
+            changed: if same_profile {
+                self.changed_lines(&baseline, snap)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Whether a failed write's report may have moved the field and the next
+    /// good read must explain it instead of reporting it.
+    fn unsure(&self, field: Carried) -> bool {
+        self.unsure_fields.contains(&field)
+    }
+
+    /// The B lines: one per readable field a pending entry holds that this read
+    /// moved, in row order, naming the mouse's new value. Each is stored with
+    /// the entry it names.
+    fn changed_lines(&self, baseline: &Snapshot, snap: &Snapshot) -> Vec<(Carried, String)> {
+        let performance = &self.overlay.performance;
+        let mut lines = Vec::new();
+        if let Some(dpi) = &performance.dpi {
+            if baseline.dpi != snap.dpi && !self.unsure(Carried::Dpi) {
+                lines.push((
+                    Carried::Dpi,
+                    format!(
+                        "DPI stages changed on the mouse to {}; your edit is kept",
+                        parse::format_dpi_stages(&snap.dpi)
+                    ),
+                ));
+            }
+            if dpi.active_stage.is_some()
+                && baseline.dpi_stage != snap.dpi_stage
+                && !self.unsure(Carried::Dpi)
+            {
+                lines.push((
+                    Carried::Dpi,
+                    format!(
+                        "active stage changed on the mouse to {}; your edit is kept",
+                        parse::format_dpi_stage(snap.dpi_stage)
+                    ),
+                ));
+            }
+        }
+        if performance.polling_rate.is_some()
+            && baseline.polling_rate != snap.polling_rate
+            && !self.unsure(Carried::PollingRate)
+        {
+            lines.push((
+                Carried::PollingRate,
+                format!(
+                    "polling rate changed on the mouse to {} Hz; your edit is kept",
+                    parse::format_polling_rate(snap.polling_rate)
+                ),
+            ));
+        }
+        if performance.lift_off.is_some()
+            && baseline.lift_off != snap.lift_off
+            && !self.unsure(Carried::LiftOff)
+        {
+            lines.push((
+                Carried::LiftOff,
+                format!(
+                    "lift-off changed on the mouse to {} mm; your edit is kept",
+                    parse::format_lift_off(snap.lift_off)
+                ),
+            ));
+        }
+        if performance.debounce.is_some()
+            && baseline.debounce != snap.debounce
+            && !self.unsure(Carried::Debounce)
+        {
+            lines.push((
+                Carried::Debounce,
+                format!(
+                    "debounce changed on the mouse to {} ms; your edit is kept",
+                    parse::format_debounce(snap.debounce)
+                ),
+            ));
+        }
+        if performance.sleep.is_some()
+            && baseline.sleep != snap.sleep
+            && !self.unsure(Carried::Sleep)
+        {
+            lines.push((
+                Carried::Sleep,
+                format!(
+                    "sleep changed on the mouse to {}; your edit is kept",
+                    parse::format_sleep(snap.sleep)
+                ),
+            ));
+        }
+        lines
     }
 
     /// Replaces the snapshot and nothing else. The overlay survives a reload;
@@ -1695,7 +1948,7 @@ impl State {
                     .dpi
                     .get_or_insert_with(|| DpiOverlay::from_snapshot(&snap));
                 if stage >= 1 && usize::from(stage) <= dpi.texts.len() {
-                    dpi.active_stage = stage;
+                    dpi.active_stage = Some(stage);
                 }
                 Some(Carried::Dpi)
             }
@@ -1956,6 +2209,16 @@ fn add_field(fields: &mut Vec<Carried>, field: Carried) {
     }
 }
 
+/// The fields a running import ends over: the check's writes plus the ops that
+/// landed. Both answers build it, re-read or not.
+fn import_carried_fields(carried: Vec<Carried>, written: &[WriteOp]) -> Vec<Carried> {
+    let mut fields = carried;
+    for field in carried_fields(written) {
+        add_field(&mut fields, field);
+    }
+    fields
+}
+
 /// Whether the entry's value equals what the snapshot shows, for both the
 /// write-answer settle and the edit-back revert.
 fn field_matches(overlay: &Overlay, snap: &Snapshot, field: Carried) -> bool {
@@ -2011,6 +2274,39 @@ fn clear_field(overlay: &mut Overlay, field: Carried) {
             }
         }
         Carried::Scroll => overlay.buttons.scroll = None,
+    }
+}
+
+/// Applies the ops a write landed to a snapshot's device-readable fields. The
+/// one place a plan's readable half becomes snapshot values, shared by the
+/// failed-re-read patch and the baseline a good re-read compares against.
+/// `same_profile` is whether the snapshot belongs to the profile the write
+/// targeted: device-wide ops are every profile's and always apply, a
+/// per-profile op applies only then.
+fn patch_ops(snap: &mut Snapshot, ops: &[WriteOp], same_profile: bool) {
+    for op in ops {
+        if !same_profile && !op.device_wide() {
+            continue;
+        }
+        match op {
+            WriteOp::PollingRate(rate) => snap.polling_rate = *rate,
+            WriteOp::LiftOff(lift_off) => snap.lift_off = *lift_off,
+            WriteOp::Sleep(delay) => snap.sleep = *delay,
+            WriteOp::Debounce(debounce) => snap.debounce = *debounce,
+            WriteOp::Dpi(stages) => {
+                snap.dpi = stages.clone();
+                // `set_dpi_stages` resets the active stage to 1 (proto).
+                if let Ok(stage) = DpiStage::new(1) {
+                    snap.dpi_stage = stage;
+                }
+            }
+            WriteOp::DpiStage(stage) => snap.dpi_stage = *stage,
+            WriteOp::Brightness(_)
+            | WriteOp::Scroll(_)
+            | WriteOp::DpiColors(_)
+            | WriteOp::Effect(_)
+            | WriteOp::Bind(_, _) => {}
+        }
     }
 }
 
@@ -2093,17 +2389,11 @@ fn plan_performance(overlay: &PerformanceOverlay, snap: &Snapshot) -> Result<Vec
             }
         }
         let list_changed = parsed.as_slice() != snap.dpi.as_slice();
-        let stage = DpiStage::new(dpi.active_stage).map_err(|error| error.to_string())?;
+        let effective = dpi.effective_stage(snap);
+        let stage = DpiStage::new(effective).map_err(|error| error.to_string())?;
         // The stage list, active stage and colours must agree before any write:
         // `set_dpi_stages` resets the active stage, and a colour list of another
         // length is refused on the wire, so an out-of-step draft would half-write.
-        if usize::from(dpi.active_stage) > parsed.len() {
-            return Err(format!(
-                "active stage {} is past the {} stage list",
-                dpi.active_stage,
-                parsed.len()
-            ));
-        }
         if let Some(colors) = &dpi.colors
             && colors.len() != parsed.len()
         {
@@ -2113,12 +2403,13 @@ fn plan_performance(overlay: &PerformanceOverlay, snap: &Snapshot) -> Result<Vec
                 parsed.len()
             ));
         }
-        let stage_changed = stage != snap.dpi_stage;
         if list_changed {
             let stages = DpiStages::new(parsed).map_err(|error| error.to_string())?;
             ops.push(WriteOp::Dpi(stages));
-        }
-        if list_changed || stage_changed {
+            // The list write resets the active stage to 1, so the effective
+            // stage follows it; an unchanged list writes one only for a pick.
+            ops.push(WriteOp::DpiStage(stage));
+        } else if dpi.active_stage.is_some() && stage != snap.dpi_stage {
             ops.push(WriteOp::DpiStage(stage));
         }
         if dpi.colors != snap.dpi_colors
@@ -2229,8 +2520,10 @@ fn remove_stage(dpi: &mut DpiOverlay, index: usize) {
         dpi.hex.remove(index);
     }
     let len = dpi.texts.len() as u8;
-    if dpi.active_stage > len {
-        dpi.active_stage = len;
+    if let Some(stage) = &mut dpi.active_stage
+        && *stage > len
+    {
+        *stage = len;
     }
 }
 
@@ -2490,3 +2783,15 @@ pub(crate) fn button_label(button: Button) -> &'static str {
 #[cfg(test)]
 #[path = "../../tests/unit/gui_state.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/gui_dpi_stage.rs"]
+mod dpi_stage_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/gui_unsure_fields.rs"]
+mod unsure_field_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/gui_import_none.rs"]
+mod import_none_tests;

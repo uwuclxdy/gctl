@@ -23,8 +23,10 @@ mod layout;
 /// The one entry to the iced_test simulator, guarded so a run from outside the
 /// repo root — where cargo does not read `.cargo/config.toml`'s `[env]` —
 /// fails loudly instead of silently rendering through wgpu and writing the
-/// real `$HOME`'s shader caches. The guard cannot stop a test from calling
-/// `iced_test::simulator` directly; that residual is caught in review.
+/// real `$HOME`'s shader caches. It renders at the window's shipped size, so
+/// every check sees the layout the window actually ships. The guard cannot stop
+/// a test from calling `iced_test::simulator` directly; that residual is caught
+/// in review.
 fn simulator<'a>(
     view: Element<'a, Message>,
 ) -> iced_test::Simulator<'a, Message, iced::Theme, iced::Renderer> {
@@ -32,7 +34,11 @@ fn simulator<'a>(
         std::env::var("ICED_TEST_BACKEND").as_deref() == Ok("tiny-skia"),
         "the view tests render through tiny-skia; set ICED_TEST_BACKEND=tiny-skia in .cargo/config.toml and run cargo from the repo root"
     );
-    iced_test::simulator(view)
+    iced_test::Simulator::with_size(
+        iced_test::core::Settings::default(),
+        window_settings().size,
+        view,
+    )
 }
 
 /// The click event sequence, so the test file spells the guarded `simulator`
@@ -1096,4 +1102,115 @@ fn a_sleep_device_pane_blocks_export_and_import() {
         &shell,
         "The mouse is asleep; wake it to export or import"
     ));
+}
+
+// --- other writers ----------------------------------------------------------
+
+const OUTSIDE_BANNER: &str = "The mouse was changed outside this window. Values marked \"Last set by gctl\" may be out of date.";
+
+/// A shell whose mouse moved a readable value no write of this window explains.
+fn outside_change_shell() -> Shell {
+    let mut machine = State::new().0;
+    machine.update(Msg::Loaded(Ok(snapshot())));
+    machine.update(Msg::Tick);
+    machine.update(Msg::Loaded(Ok(Snapshot {
+        polling_rate: PollingRate::Hz250,
+        ..snapshot()
+    })));
+    shell_with_machine(machine)
+}
+
+/// The banner names its cause with the exact copy and offers Dismiss in both
+/// themes; the click clears the state's flag through the shell's mapping.
+#[test]
+fn the_outside_change_banner_draws_in_both_themes_and_dismisses() {
+    let mut shell = outside_change_shell();
+    render_frame(&shell, "outside-banner");
+    for scheme in [Scheme::Dark, Scheme::Light] {
+        let mut ui = simulator(shell.render(scheme));
+        assert!(ui.find(OUTSIDE_BANNER).is_ok(), "banner text: {scheme:?}");
+        assert!(ui.find("Dismiss").is_ok(), "dismiss button: {scheme:?}");
+    }
+
+    let mut ui = simulator(shell.render(Scheme::Dark));
+    ui.click("Dismiss").unwrap();
+    let messages: Vec<Message> = ui.into_messages().collect();
+    assert!(!messages.is_empty(), "Dismiss emits a message");
+    for message in messages {
+        let _ = shell.update(message);
+    }
+    assert!(!shell.machine.outside_change());
+    assert!(lacks(&shell, OUTSIDE_BANNER));
+}
+
+/// The moved lines draw in their own footer slot under the notice, one
+/// capitalized line per field, in both themes.
+#[test]
+fn the_moved_lines_draw_one_line_per_field_in_both_themes() {
+    let mut machine = State::new().0;
+    machine.update(Msg::Loaded(Ok(snapshot())));
+    machine.update(Msg::Edit(Edit::PollingRate(PollingRate::Hz500)));
+    machine.update(Msg::Edit(Edit::Debounce(4)));
+    machine.update(Msg::Tick);
+    machine.update(Msg::Loaded(Ok(Snapshot {
+        polling_rate: PollingRate::Hz250,
+        debounce: gctl_proto::Debounce::new(7).unwrap(),
+        ..snapshot()
+    })));
+    let shell = shell_with_machine(machine);
+    assert_eq!(
+        shell.machine.changed(),
+        vec![
+            "polling rate changed on the mouse to 250 Hz; your edit is kept".to_owned(),
+            "debounce changed on the mouse to 7 ms; your edit is kept".to_owned(),
+        ]
+    );
+    render_frame(&shell, "outside-notice");
+    let drawn = "Polling rate changed on the mouse to 250 Hz; your edit is kept\nDebounce changed on the mouse to 7 ms; your edit is kept";
+    for scheme in [Scheme::Dark, Scheme::Light] {
+        assert!(
+            simulator(shell.render(scheme)).find(drawn).is_ok(),
+            "moved lines: {scheme:?}"
+        );
+    }
+}
+
+/// The Device pane draws a live moved line in its profile card: the mouse
+/// moved a field to the value the entry held (so the entry is not pending and
+/// selecting Device asks nothing), then moved it again.
+#[test]
+fn the_device_panes_profile_card_draws_a_live_moved_line() {
+    let mut machine = State::new().0;
+    machine.update(Msg::Loaded(Ok(snapshot())));
+    machine.update(Msg::Edit(Edit::PollingRate(PollingRate::Hz500)));
+    machine.update(Msg::Loaded(Ok(Snapshot {
+        polling_rate: PollingRate::Hz500,
+        ..snapshot()
+    })));
+    assert!(
+        !machine.pending(Section::Performance),
+        "the mouse moved to the entry's value, so nothing is pending"
+    );
+    machine.update(Msg::Select(Section::Device));
+    assert!(
+        machine.prompt().is_none(),
+        "selecting Device asks nothing with nothing pending"
+    );
+    machine.update(Msg::Loaded(Ok(Snapshot {
+        polling_rate: PollingRate::Hz250,
+        ..snapshot()
+    })));
+    let shell = shell_with_machine(machine);
+    assert_eq!(
+        shell.machine.changed(),
+        vec!["polling rate changed on the mouse to 250 Hz; your edit is kept".to_owned()]
+    );
+    render_frame(&shell, "device-moved-line");
+    let line = "Polling rate changed on the mouse to 250 Hz; your edit is kept";
+    for scheme in [Scheme::Dark, Scheme::Light] {
+        assert!(
+            simulator(shell.render(scheme)).find(line).is_ok(),
+            "device moved line: {scheme:?}"
+        );
+    }
 }

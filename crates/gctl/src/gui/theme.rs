@@ -297,6 +297,30 @@ pub(crate) fn secondary_button(scheme: Scheme) -> button::StyleFn<'static, Theme
     })
 }
 
+/// The outside-change banner's Dismiss: a secondary button edged in the warning
+/// tone, so its outline shows on the banner tint; never filled.
+pub(crate) fn warning_button(scheme: Scheme) -> button::StyleFn<'static, Theme> {
+    Box::new(move |_theme, status| {
+        let t = scheme.tokens();
+        let (background, text_color, border_color) = match status {
+            button::Status::Active => (None, t.text, t.warning),
+            button::Status::Hovered => (Some(t.surface_2), t.text, t.warning),
+            button::Status::Pressed => (Some(t.surface_3), t.text, t.warning),
+            button::Status::Disabled => (None, t.text_4, t.line),
+        };
+        button::Style {
+            background: background.map(Background::Color),
+            text_color,
+            border: Border {
+                radius: RADIUS_CONTROL.into(),
+                width: 1.0,
+                color: border_color,
+            },
+            ..button::Style::default()
+        }
+    })
+}
+
 /// An outlined danger button: danger edge, danger label stepping to danger-text
 /// on hover and press.
 pub(crate) fn danger_button(scheme: Scheme) -> button::StyleFn<'static, Theme> {
@@ -664,12 +688,16 @@ pub(crate) fn tag(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'stat
     }
 }
 
+/// The warning tint `tag_warning` and `banner_warning` share: the rendered
+/// light banner text measures 4.53:1 on it.
+const WARNING_TINT: f32 = 0.10;
+
 /// A warning-tone tag, for the `Untested` badge.
 pub(crate) fn tag_warning(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
     move |_theme| {
         let t = scheme.tokens();
         container::Style {
-            background: Some(Background::Color(tint(t.warning, 0.14))),
+            background: Some(Background::Color(tint(t.warning, WARNING_TINT))),
             text_color: Some(t.warning),
             border: Border {
                 radius: 999.0.into(),
@@ -680,27 +708,40 @@ pub(crate) fn tag_warning(scheme: Scheme) -> impl Fn(&Theme) -> container::Style
     }
 }
 
-/// The error banner: danger text on a danger tint, square on every window edge
-/// it touches.
-pub(crate) fn banner(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
-    move |_theme| {
-        let t = scheme.tokens();
-        container::Style {
-            background: Some(Background::Color(tint(t.danger, 0.14))),
-            text_color: Some(t.danger_text),
-            border: Border {
-                radius: iced::border::Radius {
-                    top_left: 0.0,
-                    top_right: 0.0,
-                    bottom_right: 0.0,
-                    bottom_left: 0.0,
-                },
-                width: 1.0,
-                color: t.line,
+/// The banner shape both banners share: text on a tint, square on every window
+/// edge it touches.
+fn banner_style(
+    background: Color,
+    text: Color,
+    line: Color,
+) -> impl Fn(&Theme) -> container::Style + 'static {
+    move |_theme| container::Style {
+        background: Some(Background::Color(background)),
+        text_color: Some(text),
+        border: Border {
+            radius: iced::border::Radius {
+                top_left: 0.0,
+                top_right: 0.0,
+                bottom_right: 0.0,
+                bottom_left: 0.0,
             },
-            ..container::Style::default()
-        }
+            width: 1.0,
+            color: line,
+        },
+        ..container::Style::default()
     }
+}
+
+/// The error banner: danger text on a danger tint.
+pub(crate) fn banner(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
+    let t = scheme.tokens();
+    banner_style(tint(t.danger, 0.14), t.danger_text, t.line)
+}
+
+/// The outside-change banner: warning text on the shared warning tint.
+pub(crate) fn banner_warning(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
+    let t = scheme.tokens();
+    banner_style(tint(t.warning, WARNING_TINT), t.warning, t.line)
 }
 
 /// The modal's card: surface-1, 18 radius, one hue-tinted float shadow.

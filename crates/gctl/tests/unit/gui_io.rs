@@ -396,6 +396,7 @@ fn apply_refuses_an_asleep_mouse_with_nothing_written() {
         Err(WriteFailure {
             message: "device is asleep".to_owned(),
             landed: Vec::new(),
+            reached: false,
         })
     );
     assert!(mouse.writes().is_empty());
@@ -421,11 +422,114 @@ fn a_failed_apply_reports_the_chain_and_forgets_the_value_it_may_have_half_writt
         Err(WriteFailure {
             message: "HID transport failed: write refused by the fake".to_owned(),
             landed: Vec::new(),
+            reached: true,
         })
     );
     mouse.fail_writes.set(false);
     let snap = read_snapshot(&device, Some(dir.path()), None).unwrap();
     assert_eq!(snap.effect, None);
+}
+
+/// `Mouse::new` after another program shrank the stage list to 400 800.
+fn two_stage_mouse() -> Mouse {
+    let mouse = Mouse::new();
+    mouse.reply(
+        0x01,
+        0x81,
+        &[(8, 2), (9, 0x01), (10, 0x90), (13, 0x03), (14, 0x20)],
+    );
+    mouse
+}
+
+#[test]
+fn a_stage_pick_the_mouse_refuses_before_its_report_owns_nothing() {
+    let dir = state();
+    let mouse = two_stage_mouse();
+    assert_eq!(
+        apply(
+            &device(&mouse),
+            Some(dir.path()),
+            profile(2),
+            &[WriteOp::DpiStage(DpiStage::new(3).unwrap())]
+        ),
+        Err(WriteFailure {
+            message: "DPI stage 3 is out of range 1..=2".to_owned(),
+            landed: Vec::new(),
+            reached: false,
+        })
+    );
+    assert!(mouse.writes().is_empty());
+}
+
+#[test]
+fn a_colour_list_the_mouse_refuses_before_its_report_owns_nothing() {
+    let dir = state();
+    let mouse = two_stage_mouse();
+    assert_eq!(
+        apply(
+            &device(&mouse),
+            Some(dir.path()),
+            profile(2),
+            &[WriteOp::DpiColors(vec![
+                rgb("ff0000"),
+                rgb("00ff00"),
+                rgb("0000ff")
+            ])]
+        ),
+        Err(WriteFailure {
+            message: "profile 2 has 2 DPI stage(s); got 3 value(s)".to_owned(),
+            landed: Vec::new(),
+            reached: false,
+        })
+    );
+    assert!(mouse.writes().is_empty());
+}
+
+#[test]
+fn a_stage_pick_whose_count_read_fails_owns_nothing() {
+    let dir = state();
+    let mouse = Mouse::new();
+    mouse.fail_read.set(Some((0x01, 0x81)));
+    assert_eq!(
+        apply(
+            &device(&mouse),
+            Some(dir.path()),
+            profile(2),
+            &[WriteOp::DpiStage(DpiStage::new(2).unwrap())]
+        ),
+        Err(WriteFailure {
+            message: "HID transport failed: device unplugged".to_owned(),
+            landed: Vec::new(),
+            reached: false,
+        })
+    );
+    assert!(mouse.writes().is_empty());
+}
+
+#[test]
+fn a_refusal_after_a_landed_write_owns_nothing_past_what_landed() {
+    // The polling report lands; the stage pick is refused before its report.
+    // The failing op sent nothing, so the earlier write's report does not make
+    // the plan this window's own.
+    let dir = state();
+    let mouse = two_stage_mouse();
+    assert_eq!(
+        apply(
+            &device(&mouse),
+            Some(dir.path()),
+            profile(2),
+            &[
+                WriteOp::PollingRate(PollingRate::Hz500),
+                WriteOp::DpiStage(DpiStage::new(3).unwrap()),
+            ]
+        ),
+        Err(WriteFailure {
+            message: "DPI stage 3 is out of range 1..=2".to_owned(),
+            landed: vec![WriteOp::PollingRate(PollingRate::Hz500)],
+            reached: false,
+        })
+    );
+    assert_eq!(mouse.writes().len(), 1, "the polling report only");
 }
 
 #[test]
@@ -533,6 +637,7 @@ fn an_import_whose_file_changed_since_its_check_writes_nothing() {
         Err(WriteFailure {
             message: format!("{path:?} changed since it was checked; import it again"),
             landed: Vec::new(),
+            reached: false,
         })
     );
     assert!(mouse.writes().is_empty());
@@ -562,6 +667,60 @@ fn an_import_whose_values_changed_since_its_check_writes_nothing() {
         Err(WriteFailure {
             message: format!("{path:?} changed since it was checked; import it again"),
             landed: Vec::new(),
+            reached: false,
+        })
+    );
+    assert!(mouse.writes().is_empty());
+}
+
+#[test]
+fn an_import_confirmed_while_the_mouse_fell_asleep_writes_nothing_and_owns_nothing() {
+    let dir = state();
+    let path = dir.path().join("p.toml");
+    std::fs::write(&path, PROFILE_ONLY).unwrap();
+    let confirmed = check_import(&path, profile(2), "Model O Wireless").unwrap();
+    let mouse = Mouse::asleep();
+    assert_eq!(
+        run_import(
+            &device(&mouse),
+            Some(dir.path()),
+            profile(2),
+            &path,
+            &confirmed
+        ),
+        Err(WriteFailure {
+            message: "device is asleep".to_owned(),
+            landed: Vec::new(),
+            reached: false,
+        })
+    );
+    assert!(mouse.writes().is_empty());
+}
+
+#[test]
+fn an_import_the_mouse_refuses_before_its_first_write_owns_nothing() {
+    // No `dpi` in the file: its stage is checked against the mouse's 2 stages.
+    let dir = state();
+    let path = dir.path().join("p.toml");
+    std::fs::write(
+        &path,
+        "format = 1\nmodel = \"Model O Wireless\"\n[profile]\ndpi_stage = 3\n",
+    )
+    .unwrap();
+    let confirmed = check_import(&path, profile(2), "Model O Wireless").unwrap();
+    let mouse = two_stage_mouse();
+    assert_eq!(
+        run_import(
+            &device(&mouse),
+            Some(dir.path()),
+            profile(2),
+            &path,
+            &confirmed
+        ),
+        Err(WriteFailure {
+            message: format!("{path:?}: profile.dpi_stage: DPI stage 3 is out of range 1..=2"),
+            landed: Vec::new(),
+            reached: false,
         })
     );
     assert!(mouse.writes().is_empty());

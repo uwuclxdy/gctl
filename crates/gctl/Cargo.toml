@@ -16,6 +16,7 @@ iced = { version = "0.14", default-features = false, features = [
     "x11",
     "tokio",
     "crisp",
+    "linux-theme-detection",
 ] }
 serde.workspace = true
 thiserror.workspace = true

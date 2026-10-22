@@ -27,6 +27,8 @@ type ReplyKey = (u8, u8);
 struct Fake {
     sent: RefCell<Vec<Report>>,
     replies: RefCell<HashMap<ReplyKey, VecDeque<Report>>>,
+    /// Records each write report (`[6]` below `0x80`), then fails its send.
+    fail_writes: Cell<bool>,
 }
 
 impl Fake {
@@ -46,6 +48,9 @@ impl Fake {
 impl Transport for Fake {
     fn send(&self, report: &Report) -> Result<(), TransportError> {
         self.sent.borrow_mut().push(*report);
+        if self.fail_writes.get() && report[6] < 0x80 {
+            return Err("write refused by the fake".into());
+        }
         Ok(())
     }
 
@@ -1289,6 +1294,137 @@ fn set_scroll_invert_rebinds_every_profile() {
         }
     }
     assert_eq!(fake.sent(), expected);
+}
+
+// ---------------------------------------------------------------- write count
+
+/// The write reports `fake` was handed, failed sends included: every read
+/// request carries a `0x8N` command, every write a `0x0N` one.
+fn writes_handed(fake: &Fake) -> u64 {
+    fake.sent().iter().filter(|r| r[6] < 0x80).count() as u64
+}
+
+#[test]
+fn writes_sent_counts_each_write_report_a_setter_hands_over() {
+    let fake = Fake::default();
+    let device = device(&fake);
+    assert_eq!(device.writes_sent(), 0, "a fresh device");
+
+    device.set_profile(p(2)).unwrap();
+    assert_eq!(device.writes_sent(), 1, "set_profile: one report");
+
+    let stages = DpiStages::new(vec![Dpi::new(400).unwrap(), Dpi::new(800).unwrap()]).unwrap();
+    device.set_dpi_stages(p(1), &stages).unwrap();
+    assert_eq!(
+        device.writes_sent(),
+        3,
+        "set_dpi_stages: stage 1, then the list"
+    );
+
+    stage_count_reply(&fake, 3);
+    device
+        .set_dpi_stage(p(1), DpiStage::new(3).unwrap())
+        .unwrap();
+    assert_eq!(
+        device.writes_sent(),
+        4,
+        "set_dpi_stage: the count read adds none"
+    );
+
+    device
+        .set_brightness(Brightness {
+            wired: 200,
+            wireless: 50,
+        })
+        .unwrap();
+    assert_eq!(
+        device.writes_sent(),
+        6,
+        "set_brightness: wired, then wireless"
+    );
+
+    device.set_scroll(ScrollDirection::Invert).unwrap();
+    assert_eq!(
+        device.writes_sent(),
+        12,
+        "set_scroll: two binds per profile"
+    );
+
+    fake.reply((3, 0x00), rep(&[(0, 0xA2)]));
+    device.bind(p(1), Button::Back, Binding::None).unwrap();
+    assert_eq!(
+        device.writes_sent(),
+        14,
+        "bind: the report, then its resend"
+    );
+
+    assert_eq!(device.writes_sent(), writes_handed(&fake));
+}
+
+#[test]
+fn reads_and_refusals_before_a_report_count_no_write() {
+    let fake = Fake::default();
+    let device = device(&fake);
+    // Every read gives up on the fake's stale replies; each still sends its request.
+    let _ = device.status();
+    let _ = device.battery();
+    let _ = device.firmware();
+    let _ = device.profile();
+    let _ = device.dpi(p(1));
+    let _ = device.polling_rate();
+    let _ = device.lift_off();
+    let _ = device.debounce(p(1));
+    let _ = device.sleep_delay();
+    assert!(!fake.sent().is_empty(), "premise: the reads sent requests");
+    assert_eq!(device.writes_sent(), 0, "reads");
+
+    stage_count_reply(&fake, 2);
+    device
+        .set_dpi_stage(p(1), DpiStage::new(3).unwrap())
+        .unwrap_err();
+    assert_eq!(device.writes_sent(), 0, "a stage past the count");
+
+    stage_count_reply(&fake, 2);
+    device
+        .set_dpi_colors(p(1), &[rgb("ff0000"), rgb("00ff00"), rgb("0000ff")])
+        .unwrap_err();
+    assert_eq!(
+        device.writes_sent(),
+        0,
+        "a colour list longer than the count"
+    );
+
+    // no count reply queued: the count read itself fails
+    device
+        .set_dpi_stage(p(1), DpiStage::new(1).unwrap())
+        .unwrap_err();
+    assert_eq!(device.writes_sent(), 0, "a failed count read");
+
+    assert_eq!(writes_handed(&fake), 0, "premise: no write report was sent");
+}
+
+#[test]
+fn a_write_report_whose_send_fails_still_counts() {
+    let fake = Fake::default();
+    fake.fail_writes.set(true);
+    let device = device(&fake);
+
+    let err = device.set_polling_rate(PollingRate::Hz500).unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "{err:?}");
+    assert_eq!(device.writes_sent(), 1, "the failed report may have landed");
+
+    device
+        .set_brightness(Brightness {
+            wired: 200,
+            wireless: 50,
+        })
+        .unwrap_err();
+    assert_eq!(
+        device.writes_sent(),
+        2,
+        "the wired report failed, the wireless one was never handed over"
+    );
+    assert_eq!(device.writes_sent(), writes_handed(&fake));
 }
 
 // ---------------------------------------------------------------- values

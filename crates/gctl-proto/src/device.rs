@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::bind::{Binding, Button, DpiFn, KeyboardFn, MediaFn, MouseFn};
@@ -65,6 +66,8 @@ pub struct Device<T> {
     transport: T,
     model: &'static Model,
     io_delay: Duration,
+    /// Write reports handed to the transport so far; see [`Device::writes_sent`].
+    writes_sent: AtomicU64,
 }
 
 /// Number of times to poll for a read reply before giving up.
@@ -82,7 +85,17 @@ impl<T: Transport> Device<T> {
             transport,
             model,
             io_delay: Self::IO_DELAY,
+            writes_sent: AtomicU64::new(0),
         }
+    }
+
+    /// The number of write reports this device has handed to its transport.
+    ///
+    /// Every write report a setter sends counts, a failed send included: the
+    /// report may have reached the mouse. Read requests never count.
+    #[must_use]
+    pub fn writes_sent(&self) -> u64 {
+        self.writes_sent.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -586,7 +599,15 @@ impl<T: Transport> Device<T> {
         report
     }
 
+    /// Hands one report to the transport, counting it first when it is a write.
+    ///
+    /// Read requests carry an `0x8N` command at byte 6; a write report's byte 6
+    /// is below `0x80`. Counting before the call keeps a failed send counted:
+    /// it may have reached the mouse.
     fn send(&self, report: &Report) -> Result<()> {
+        if report[6] < 0x80 {
+            self.writes_sent.fetch_add(1, Ordering::Relaxed);
+        }
         self.transport.send(report).map_err(Error::Transport)
     }
 

@@ -1,0 +1,133 @@
+name: ci
+
+on:
+  push:
+    branches: [mommy]
+    paths-ignore:
+      - "**/*.md"
+      - wiki/**
+      - docs/**
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - wiki/**
+      - docs/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  fmt:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: fmt --check
+        run: cargo fmt --all -- --check
+
+  check:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: hidapi and pkg-config for the build scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config
+      - name: fast linker (mold on linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y mold
+          echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: clippy (-D warnings)
+        run: cargo clippy --all-targets --all-features --release --locked --workspace -- -D warnings
+      - name: clippy gctl-proto without its default feature
+        run: cargo clippy -p gctl-proto --all-targets --no-default-features --release --locked -- -D warnings
+      - name: test
+        run: cargo nextest run --release --all-features --locked --workspace --no-fail-fast
+      - name: doctests
+        shell: bash
+        run: |
+          if cargo metadata --no-deps --format-version 1 | grep -q '"doctest":true'; then
+            cargo test --release --doc --all-features --locked --workspace
+          else
+            echo "no doctest targets; skipping"
+          fi
+      - name: build release binary
+        run: cargo build --release --locked --workspace
+      - name: upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: gctl
+          if-no-files-found: error
+          retention-days: 1
+          path: target/release/gctl
+
+  msrv:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: read rust-version from the manifest
+        id: msrv
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -e -r '[.packages[].rust_version | select(. != null and . != "")] | unique | if length == 0 then "" elif length == 1 then .[0] else error("workspace members declare different rust_version values: \(.)") end')
+          if [ -z "$version" ]; then
+            echo "::notice::no rust-version in the manifest; skipping the MSRV check"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: hidapi and pkg-config for the build scripts
+        if: steps.msrv.outputs.version != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config
+      - if: steps.msrv.outputs.version != ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - if: steps.msrv.outputs.version != ''
+        uses: Swatinem/rust-cache@v2
+      - name: check on the declared toolchain
+        if: steps.msrv.outputs.version != ''
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+${MSRV}" check --workspace --all-targets --all-features --locked
+
+  deny:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  audit:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@cargo-audit
+      - name: cargo audit
+        run: cargo audit

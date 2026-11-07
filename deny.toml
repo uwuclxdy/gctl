@@ -1,0 +1,45 @@
+# cargo-deny config — license + advisory + source checks.
+# The gate (cargo.sh) and CI's deny job both run `cargo deny check advisories licenses bans sources`.
+
+[graph]
+all-features = true
+
+[advisories]
+# cargo-deny 0.20.2 defaults: vulnerability deny, unmaintained all-scope,
+# unsound workspace-scope, yanked warn. Pin `yanked` and narrow `unmaintained`
+# as below; silence specific ids via `ignore`.
+yanked       = "deny"
+unmaintained = "workspace"  # direct deps only, not deep transitives we can't control
+ignore       = []
+
+[licenses]
+confidence-threshold = 0.8  # cargo-deny's default, stated for clarity
+# Workspace members are GPL-3.0-only and unpublished; third-party licences below.
+private = { ignore = true }
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+  "Zlib",
+  "BSL-1.0",   # clipboard-win and error-code, via iced's clipboard
+  "CC0-1.0",   # hexf-parse
+]
+
+[bans]
+multiple-versions = "warn"
+# cargo-deny cannot see through workspace inheritance: `gctl-proto.workspace = true`
+# (pinned in the root manifest) reads as a wildcard at the member level. warn, not deny.
+wildcards         = "warn"
+deny              = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

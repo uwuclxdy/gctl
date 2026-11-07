@@ -1,0 +1,13 @@
+# Glorious Core v1 wireless mice: give the logged-in user access to the hidraw node.
+# Install: sudo cp 70-gctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2011", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2022", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2024", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2013", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2012", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2023", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2025", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2015", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2018", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2034", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="2031", TAG+="uaccess"

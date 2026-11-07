@@ -118,7 +118,7 @@ fn light_tokens_match_the_hex_table() {
             ("text", "#2B2D38"),
             ("text-2", "#4A4C58"),
             ("text-3", "#60636E"),
-            ("text-4", "#676A74"),
+            ("text-4", "#656771"),
             ("accent", "#007AB9"),
             ("accent-hover", "#0068A3"),
             ("accent-press", "#00598E"),
@@ -350,6 +350,154 @@ fn disabled_buttons_keep_the_designs_silhouettes() {
     }
 }
 
+// --- no button is bare text ----------------------------------------------------
+
+fn draws(background: Option<iced::Background>, border: iced::Border) -> bool {
+    let fill = match background {
+        Some(iced::Background::Color(color)) => color.a > 0.0,
+        Some(iced::Background::Gradient(_)) => true,
+        None => false,
+    };
+    fill || (border.width > 0.0 && border.color.a > 0.0)
+}
+
+/// Every button variant draws a fill or a border at rest, in both schemes:
+/// the session-8 frame had Remove and Revert as bare text.
+#[test]
+fn every_button_variant_draws_a_fill_or_a_border_at_rest() {
+    use iced::widget::button::Status;
+    for scheme in [Scheme::Dark, Scheme::Light] {
+        let theme = scheme.theme();
+        for (name, style) in [
+            ("filled", filled_button(scheme)),
+            ("primary", primary_button(scheme)),
+            ("secondary", secondary_button(scheme)),
+            ("warning", warning_button(scheme)),
+            ("danger", danger_button(scheme)),
+            ("quiet", quiet_button(scheme)),
+        ] {
+            let rest = style(&theme, Status::Active);
+            assert!(
+                draws(rest.background, rest.border),
+                "{scheme:?} {name}: {rest:?}"
+            );
+        }
+    }
+}
+
+/// The profile picker's track frames all three segments, the unpicked ones
+/// included (the session-8 frame drew no frame around `2` and `3`).
+#[test]
+fn the_segmented_controls_track_draws_a_fill_or_a_border() {
+    for scheme in [Scheme::Dark, Scheme::Light] {
+        let style = segment_track(scheme)(&scheme.theme());
+        assert!(
+            draws(style.background, style.border),
+            "{scheme:?}: {style:?}"
+        );
+    }
+}
+
+// --- embedded fonts ------------------------------------------------------------
+
+fn be16(bytes: &[u8], at: usize) -> usize {
+    usize::from(u16::from_be_bytes([bytes[at], bytes[at + 1]]))
+}
+
+fn be32(bytes: &[u8], at: usize) -> usize {
+    usize::try_from(u32::from_be_bytes([
+        bytes[at],
+        bytes[at + 1],
+        bytes[at + 2],
+        bytes[at + 3],
+    ]))
+    .unwrap()
+}
+
+/// The family names (name IDs 1 and 16, Windows Unicode records) of one
+/// OpenType file, read straight off its `name` table per the OpenType spec, so
+/// the check shares no code with the font stack under test.
+fn family_names(font: &[u8]) -> Vec<String> {
+    let version = be32(font, 0);
+    assert!(
+        version == 0x0001_0000 || version == 0x4F54_544F,
+        "not an OpenType file: version {version:#x}"
+    );
+    let tables = be16(font, 4);
+    let name = (0..tables)
+        .map(|index| 12 + 16 * index)
+        .find(|&record| &font[record..record + 4] == b"name")
+        .map(|record| be32(font, record + 8))
+        .expect("no name table");
+    let count = be16(font, name + 2);
+    let strings = name + be16(font, name + 4);
+    let mut names = Vec::new();
+    for index in 0..count {
+        let record = name + 6 + 12 * index;
+        let (platform, name_id) = (be16(font, record), be16(font, record + 6));
+        if platform != 3 || !(name_id == 1 || name_id == 16) {
+            continue;
+        }
+        let (length, offset) = (be16(font, record + 8), be16(font, record + 10));
+        let (pairs, _) = font[strings + offset..strings + offset + length].as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().copied().map(u16::from_be_bytes).collect();
+        names.push(String::from_utf16(&units).unwrap());
+    }
+    names
+}
+
+#[test]
+fn family_names_reads_a_known_name_table() {
+    // a one-table font: the name table holds one Windows record, family "Ab"
+    let mut font = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    font.extend_from_slice(b"name");
+    font.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 28, 0, 0, 0, 22]);
+    font.extend_from_slice(&[0, 0, 0, 1, 0, 18]);
+    font.extend_from_slice(&[0, 3, 0, 1, 0x04, 0x09, 0, 1, 0, 4, 0, 0]);
+    font.extend_from_slice(&[0, b'A', 0, b'b']);
+    assert_eq!(family_names(&font), vec!["Ab".to_owned()]);
+}
+
+/// The binary carries Onest and JetBrains Mono, the families `UI_FONT` and
+/// `MONO_FONT` ask for, so no text falls back to the desktop's sans.
+#[test]
+fn the_embedded_fonts_are_onest_and_jetbrains_mono() {
+    let families: Vec<String> = FONTS.iter().flat_map(|font| family_names(font)).collect();
+    for family in ["Onest", "JetBrains Mono"] {
+        assert!(
+            families.iter().any(|name| name == family),
+            "{family} not embedded: {families:?}"
+        );
+    }
+}
+
+/// Each embedded family's OFL text ships beside `LICENSE`.
+#[test]
+fn each_embedded_family_ships_its_ofl_text() {
+    for (family, text) in [
+        (
+            "Onest",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../LICENSE-OFL-Onest"
+            )),
+        ),
+        (
+            "JetBrains Mono",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../LICENSE-OFL-JetBrains-Mono"
+            )),
+        ),
+    ] {
+        assert!(
+            text.contains("SIL OPEN FONT LICENSE Version 1.1"),
+            "{family}: not the OFL 1.1"
+        );
+        assert!(text.contains(family), "{family}: its copyright line");
+    }
+}
+
 // --- the toggle stays visible --------------------------------------------------
 
 fn luminance(color: Color) -> f32 {
@@ -407,6 +555,19 @@ fn an_unknown_sliders_handle_clears_3_to_1_against_its_rail_and_the_card() {
         let on_card = contrast(handle, card);
         assert!(on_rail >= 3.0, "{scheme:?} handle vs rail {on_rail:.2}");
         assert!(on_card >= 3.0, "{scheme:?} handle vs card {on_card:.2}");
+    }
+}
+
+/// The dimmest text step (placeholders, empty pickers) clears 4.5:1 on every
+/// resting surface it draws on: the well, the page and the card.
+#[test]
+fn the_dimmest_text_clears_4_5_to_1_on_every_resting_surface() {
+    for scheme in [Scheme::Dark, Scheme::Light] {
+        let t = scheme.tokens();
+        for (name, surface) in [("well", t.well), ("bg", t.bg), ("surface-1", t.surface_1)] {
+            let ratio = contrast(t.text_4, surface);
+            assert!(ratio >= 4.5, "{scheme:?} text-4 on {name} {ratio:.2}");
+        }
     }
 }
 

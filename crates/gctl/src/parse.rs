@@ -744,59 +744,122 @@ pub fn effect(s: &str) -> Result<Effect, ParseError> {
         }
     }
 
-    let speed = |rate: Option<Rate>| rate.unwrap_or(Rate::DEFAULT);
-    match name {
-        "off" => {
-            require_none(name, &colors, &rate)?;
-            Ok(Effect::Off)
+    let Some((_, make)) = EFFECTS.iter().find(|(token, _)| *token == name).copied() else {
+        return Err(err(format!("unknown effect {name:?}")));
+    };
+    make(name, colors, rate)
+}
+
+/// One effect name and the builder that validates the arguments it takes. The
+/// parser looks names up here and the window's picker offers [`EFFECT_NAMES`]
+/// built from the same table, so neither can name an effect the other rejects.
+type EffectMake = fn(&str, Vec<Rgb>, Option<Rate>) -> Result<Effect, ParseError>;
+
+const EFFECTS: [(&str, EffectMake); 9] = [
+    ("off", effect_off),
+    ("glorious", effect_glorious),
+    ("cycle", effect_cycle),
+    ("pulse", effect_pulse),
+    ("solid", effect_solid),
+    ("pulse-one", effect_pulse_one),
+    ("tail", effect_tail),
+    ("rave", effect_rave),
+    ("wave", effect_wave),
+];
+
+/// The effect names the CLI accepts, in the order the window offers them.
+pub const EFFECT_NAMES: [&str; 9] = effect_names(&EFFECTS);
+
+const fn effect_names(table: &[(&'static str, EffectMake); 9]) -> [&'static str; 9] {
+    let mut names = [""; 9];
+    let mut index = 0;
+    while index < 9 {
+        names[index] = table[index].0;
+        index += 1;
+    }
+    names
+}
+
+fn speed(rate: Option<Rate>) -> Rate {
+    rate.unwrap_or(Rate::DEFAULT)
+}
+
+fn effect_off(name: &str, colors: Vec<Rgb>, rate: Option<Rate>) -> Result<Effect, ParseError> {
+    require_none(name, &colors, &rate)?;
+    Ok(Effect::Off)
+}
+
+fn effect_glorious(name: &str, colors: Vec<Rgb>, rate: Option<Rate>) -> Result<Effect, ParseError> {
+    require_no_colors(name, &colors)?;
+    Ok(Effect::Glorious { rate: speed(rate) })
+}
+
+fn effect_cycle(name: &str, colors: Vec<Rgb>, rate: Option<Rate>) -> Result<Effect, ParseError> {
+    require_no_colors(name, &colors)?;
+    Ok(Effect::Cycle { rate: speed(rate) })
+}
+
+fn effect_pulse(_name: &str, colors: Vec<Rgb>, rate: Option<Rate>) -> Result<Effect, ParseError> {
+    let effect = Effect::Pulse {
+        rate: speed(rate),
+        colors,
+    };
+    effect.check().map_err(|e| err(e.to_string()))?;
+    Ok(effect)
+}
+
+fn effect_solid(name: &str, colors: Vec<Rgb>, rate: Option<Rate>) -> Result<Effect, ParseError> {
+    require_no_rate(name, &rate)?;
+    match colors.as_slice() {
+        [color] => Ok(Effect::Solid { color: *color }),
+        _ => Err(err("solid takes exactly one colour")),
+    }
+}
+
+fn effect_pulse_one(
+    _name: &str,
+    colors: Vec<Rgb>,
+    rate: Option<Rate>,
+) -> Result<Effect, ParseError> {
+    match colors.as_slice() {
+        [color] => Ok(Effect::PulseOne {
+            rate: speed(rate),
+            color: *color,
+        }),
+        _ => Err(err("pulse-one takes exactly one colour")),
+    }
+}
+
+fn effect_tail(name: &str, colors: Vec<Rgb>, rate: Option<Rate>) -> Result<Effect, ParseError> {
+    require_no_colors(name, &colors)?;
+    Ok(Effect::Tail { rate: speed(rate) })
+}
+
+fn effect_rave(_name: &str, colors: Vec<Rgb>, rate: Option<Rate>) -> Result<Effect, ParseError> {
+    let effect = Effect::Rave {
+        rate: speed(rate),
+        colors,
+    };
+    effect.check().map_err(|e| err(e.to_string()))?;
+    Ok(effect)
+}
+
+fn effect_wave(name: &str, colors: Vec<Rgb>, rate: Option<Rate>) -> Result<Effect, ParseError> {
+    require_no_colors(name, &colors)?;
+    Ok(Effect::Wave { rate: speed(rate) })
+}
+
+/// The window's label for an effect name: the CLI token title-cased, its
+/// hyphens as spaces (`pulse-one` -> `Pulse one`).
+pub fn effect_label(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out = first.to_uppercase().collect::<String>();
+            out.push_str(chars.as_str());
+            out.replace('-', " ")
         }
-        "glorious" => {
-            require_no_colors(name, &colors)?;
-            Ok(Effect::Glorious { rate: speed(rate) })
-        }
-        "cycle" => {
-            require_no_colors(name, &colors)?;
-            Ok(Effect::Cycle { rate: speed(rate) })
-        }
-        "pulse" => {
-            let effect = Effect::Pulse {
-                rate: speed(rate),
-                colors,
-            };
-            effect.check().map_err(|e| err(e.to_string()))?;
-            Ok(effect)
-        }
-        "solid" => {
-            require_no_rate(name, &rate)?;
-            match colors.as_slice() {
-                [color] => Ok(Effect::Solid { color: *color }),
-                _ => Err(err("solid takes exactly one colour")),
-            }
-        }
-        "pulse-one" => match colors.as_slice() {
-            [color] => Ok(Effect::PulseOne {
-                rate: speed(rate),
-                color: *color,
-            }),
-            _ => Err(err("pulse-one takes exactly one colour")),
-        },
-        "tail" => {
-            require_no_colors(name, &colors)?;
-            Ok(Effect::Tail { rate: speed(rate) })
-        }
-        "rave" => {
-            let effect = Effect::Rave {
-                rate: speed(rate),
-                colors,
-            };
-            effect.check().map_err(|e| err(e.to_string()))?;
-            Ok(effect)
-        }
-        "wave" => {
-            require_no_colors(name, &colors)?;
-            Ok(Effect::Wave { rate: speed(rate) })
-        }
-        _ => Err(err(format!("unknown effect {name:?}"))),
+        None => String::new(),
     }
 }
 
@@ -859,3 +922,7 @@ pub fn format_battery(battery: Battery) -> String {
 pub fn format_firmware(firmware: Firmware) -> String {
     firmware.to_string()
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/parse_effects.rs"]
+mod effect_tests;

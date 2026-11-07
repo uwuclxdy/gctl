@@ -9,57 +9,26 @@
 use std::path::Path;
 
 use gctl_proto::{
-    Battery, Binding, Button, DeviceState, Dpi, DpiFn, DpiStage, DpiStages, Effect, Firmware,
-    KeyboardFn, LiftOff, MODELS, MediaFn, MouseFn, PollingRate, Profile, Rate, SleepDelay,
+    Binding, Button, DpiFn, Effect, KeyboardFn, MODELS, MediaFn, MouseFn, PollingRate, Rate,
+    SleepDelay,
 };
 
 use super::*;
 use crate::gui::state::{Edit, Msg, Notice, Section, Snapshot, State};
 use crate::gui::theme::Scheme;
 
+use crate::gui::testutil::{
+    click, on_section, profile, shell, shell_with_machine, simulator, simulator_sized, snapshot,
+};
+
 #[path = "gui_layout.rs"]
 mod layout;
 
-/// The one entry to the iced_test simulator, guarded so a run from outside the
-/// repo root — where cargo does not read `.cargo/config.toml`'s `[env]` —
-/// fails loudly instead of silently rendering through wgpu and writing the
-/// real `$HOME`'s shader caches. It renders at the window's shipped size, so
-/// every check sees the layout the window actually ships. The guard cannot stop
-/// a test from calling `iced_test::simulator` directly; that residual is caught
-/// in review.
-fn simulator<'a>(
-    view: Element<'a, Message>,
-) -> iced_test::Simulator<'a, Message, iced::Theme, iced::Renderer> {
-    assert!(
-        std::env::var("ICED_TEST_BACKEND").as_deref() == Ok("tiny-skia"),
-        "the view tests render through tiny-skia; set ICED_TEST_BACKEND=tiny-skia in .cargo/config.toml and run cargo from the repo root"
-    );
-    iced_test::Simulator::with_size(
-        iced_test::core::Settings::default(),
-        window_settings().size,
-        view,
-    )
-}
+#[path = "gui_motion.rs"]
+mod motion;
 
-/// The click event sequence, so the test file spells the guarded `simulator`
-/// path once and no iced_test simulator module path anywhere else.
-fn click() -> impl Iterator<Item = iced::Event> {
-    [
-        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
-        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-            iced::mouse::Button::Left,
-        )),
-    ]
-    .into_iter()
-}
-
-fn profile(id: u8) -> Profile {
-    Profile::new(id).unwrap()
-}
-
-fn stages(values: &[u16]) -> DpiStages {
-    DpiStages::new(values.iter().map(|v| Dpi::new(*v).unwrap()).collect()).unwrap()
-}
+#[path = "gui_live.rs"]
+mod live;
 
 const BUTTONS: [Button; 8] = [
     Button::Left,
@@ -71,59 +40,6 @@ const BUTTONS: [Button; 8] = [
     Button::ScrollDown,
     Button::Dpi,
 ];
-
-/// The fake mouse of the unit tests, with nothing remembered.
-fn snapshot() -> Snapshot {
-    Snapshot {
-        model: &MODELS[0],
-        battery: Battery {
-            state: DeviceState::Awake,
-            percent: Some(35),
-        },
-        firmware: Firmware([0, 3, 8, 0]),
-        active: profile(2),
-        profile: profile(2),
-        polling_rate: PollingRate::Hz1000,
-        lift_off: LiftOff::Mm1,
-        sleep: SleepDelay::Seconds(120),
-        brightness: None,
-        scroll: None,
-        dpi: stages(&[400, 800, 1600]),
-        dpi_stage: DpiStage::new(2).unwrap(),
-        dpi_colors: None,
-        debounce: gctl_proto::Debounce::new(10).unwrap(),
-        effect: None,
-        binds: BUTTONS.iter().map(|button| (*button, None)).collect(),
-        memory_error: None,
-    }
-}
-
-fn shell_with_machine(machine: State) -> Shell {
-    Shell {
-        machine,
-        device: None,
-        state_dir: None,
-        lock_path: None,
-        export_path: String::new(),
-        import_path: String::new(),
-        scheme: Scheme::Dark,
-    }
-}
-
-/// A shell whose machine has loaded `snap`.
-fn shell(snap: Snapshot) -> Shell {
-    let (mut machine, _) = State::new();
-    machine.update(Msg::Loaded(Ok(snap)));
-    shell_with_machine(machine)
-}
-
-/// A shell on a given section.
-fn on_section(snap: Snapshot, section: Section) -> Shell {
-    let mut machine = State::new().0;
-    machine.update(Msg::Loaded(Ok(snap)));
-    machine.update(Msg::Select(section));
-    shell_with_machine(machine)
-}
 
 fn asleep_shell() -> Shell {
     let (mut machine, _) = State::new();
@@ -191,7 +107,9 @@ fn performance_marks_device_wide_rows_and_unknown_colours() {
     let shell = shell(snapshot());
     render_frame(&shell, "performance");
     assert_eq!(count(&shell, "all profiles"), 3);
-    assert_eq!(count(&shell, "Unknown"), 3);
+    // each stage's tag names what is unknown: its colour
+    assert_eq!(count(&shell, "Colour unknown"), 3);
+    assert_eq!(count(&shell, "Unknown"), 0);
     assert!(contains(&shell, "per profile"));
     assert!(contains(&shell, "Add stage"));
     assert!(contains(&shell, "Stage 1"));
@@ -481,12 +399,63 @@ fn import_cancel_closes_the_modal_and_frees_the_line() {
 
 // --- the sidebar ----------------------------------------------------------------
 
+/// A caps eyebrow as the view draws it: every character upper-cased, a hair
+/// space (U+200A) between characters, since iced has no letter-spacing.
+fn eyebrow(word: &str) -> String {
+    word.chars()
+        .flat_map(char::to_uppercase)
+        .map(String::from)
+        .collect::<Vec<_>>()
+        .join("\u{200A}")
+}
+
 #[test]
-fn sidebar_shows_the_edit_row_and_active_profile() {
+fn eyebrow_spaces_every_character_with_a_hair_space() {
+    assert_eq!(eyebrow("Dpi"), "D\u{200A}P\u{200A}I");
+    assert_eq!(eyebrow("a b"), "A\u{200A} \u{200A}B");
+}
+
+/// The sidebar per gui.md's sketch: the link as an eyebrow on the battery
+/// line, the battery as a bare %, `Profile` and `Settings` eyebrows; the old
+/// `Edit` row and `Active profile:` line are gone.
+#[test]
+fn the_sidebar_shows_the_link_eyebrow_battery_and_group_eyebrows() {
     let shell = shell(snapshot());
-    assert!(contains(&shell, "Edit"));
-    assert!(contains(&shell, "Active profile: 2"));
-    assert!(contains(&shell, "Battery 35%"));
+    render_frame(&shell, "sidebar");
+    for text in [
+        eyebrow("Wireless"),
+        "35%".to_owned(),
+        eyebrow("Profile"),
+        eyebrow("Settings"),
+    ] {
+        assert!(contains(&shell, &text), "{text:?}");
+    }
+    for text in ["Edit", "Active profile: 2", "Battery 35%", "Wireless"] {
+        assert!(lacks(&shell, text), "{text:?}");
+    }
+}
+
+/// `Make N active` names the edited profile and shows only while the edited
+/// profile is not the active one.
+#[test]
+fn make_n_active_shows_only_while_the_edited_profile_is_not_active() {
+    let same = shell(snapshot());
+    for text in [
+        "Make 1 active",
+        "Make 2 active",
+        "Make 3 active",
+        "Make active",
+    ] {
+        assert!(lacks(&same, text), "edited == active: {text:?}");
+    }
+    let mut other = shell(snapshot());
+    other.machine.update(Msg::PickProfile(profile(3)));
+    other.machine.update(Msg::Loaded(Ok(Snapshot {
+        profile: profile(3),
+        ..snapshot()
+    })));
+    assert!(contains(&other, "Make 3 active"));
+    assert!(lacks(&other, "Make active"));
 }
 
 #[test]
@@ -508,9 +477,9 @@ fn make_active_click_sends_the_request() {
         ..snapshot()
     })));
     render_frame(&shell, "sidebar-make-active");
-    assert!(contains(&shell, "Make active"));
+    assert!(contains(&shell, "Make 3 active"));
     let mut ui = simulator(shell.view());
-    ui.click("Make active").unwrap();
+    ui.click("Make 3 active").unwrap();
     let messages: Vec<Message> = ui.into_messages().collect();
     assert!(!messages.is_empty(), "Make active emits a message");
     let mut requests = Vec::new();
@@ -559,10 +528,10 @@ fn the_longest_model_name_does_not_clip_the_badge() {
     assert!(contains(&shell, "Untested"));
 }
 
-// --- review round 5 ------------------------------------------------------------
+// --- unknown sliders, scroll marks and binds ------------------------------------
 
 /// A click inside an unknown brightness slider picks a value and releases: the
-/// release must keep the picked value, never clobber it to 0 (H6).
+/// release must keep the picked value, never clobber it to 0.
 #[test]
 fn releasing_an_unknown_slider_keeps_a_picked_value() {
     let shell = on_section(snapshot(), Section::Lighting);
@@ -597,7 +566,7 @@ fn releasing_an_unknown_slider_keeps_a_picked_value() {
 }
 
 /// A click at the left edge of an unknown slider changes nothing, so only the
-/// release speaks: the link becomes 0 (G10's claim, kept by the fix).
+/// release speaks: the link becomes 0.
 #[test]
 fn a_click_at_the_left_edge_of_an_unknown_slider_sets_zero() {
     let shell = on_section(snapshot(), Section::Lighting);
@@ -620,7 +589,7 @@ fn a_click_at_the_left_edge_of_an_unknown_slider_sets_zero() {
     assert_eq!(shell.machine.brightness_wired(), Some(0));
 }
 
-/// Picking a scroll direction drops the row's `Unknown` mark (H7): the dimming
+/// Picking a scroll direction drops the row's `Unknown` mark: the dimming
 /// and the mark follow the shown value, not the snapshot.
 #[test]
 fn a_picked_scroll_direction_drops_the_unknown_mark() {
@@ -636,7 +605,7 @@ fn a_picked_scroll_direction_drops_the_unknown_mark() {
 }
 
 /// A bind text that fails to parse becomes an invalid entry, not a silent
-/// `Binding::None` (H12).
+/// `Binding::None`.
 #[test]
 fn an_invalid_bind_text_is_an_invalid_entry() {
     assert_eq!(
@@ -787,18 +756,37 @@ fn bind_family_rows_pair_each_token_with_its_category() {
     }
 }
 
-// --- pickers driven through iced_test (review round 8) ---------------------------
+// --- pickers driven through iced_test ---------------------------
 
-/// iced_test's default simulator window height (1024x768), the viewport the
-/// pick menu measures `space_below`/`space_above` against when it decides
-/// whether to open below or above the picker.
-const WINDOW_HEIGHT: f32 = 768.0;
+/// A dropdown row's height, the panel's gutter above its first and below its
+/// last row, the tallest a panel draws (the design's select), and the gap
+/// between the panel and its trigger.
+const MENU_ROW: f32 = 36.0;
+const MENU_GUTTER: f32 = 4.0;
+const MENU_MAX: f32 = 240.0;
+const MENU_GAP: f32 = 6.0;
 
-/// The edit one pick produces: opening the picker (by its container id) and
-/// selecting the menu option at `option_index` of `option_count`. The menu
-/// opens below the picker unless more space is above, and each option is
-/// exactly one picker-height tall, so the option's position follows from the
-/// picker's bounds alone.
+/// Where an open dropdown's panel sits, per gui.md: `MENU_GAP` clear of its
+/// trigger, below it whenever the room below holds the panel and that gap,
+/// else on the side with more room; the panel is its rows plus the gutter, at
+/// most `MENU_MAX` tall. Returns the panel's top edge and height in a window
+/// `height` tall.
+fn menu_panel(bounds: iced::Rectangle, option_count: usize, height: f32) -> (f32, f32) {
+    let panel = (option_count as f32 * MENU_ROW + 2.0 * MENU_GUTTER).min(MENU_MAX);
+    let room_below = height - (bounds.y + bounds.height);
+    if room_below >= panel + MENU_GAP || room_below > bounds.y {
+        (bounds.y + bounds.height + MENU_GAP, panel)
+    } else {
+        (bounds.y - MENU_GAP - panel, panel)
+    }
+}
+
+/// The y of the centre of row `index` of an unscrolled open panel.
+fn menu_row_y(bounds: iced::Rectangle, option_count: usize, index: usize, height: f32) -> f32 {
+    let (top, _) = menu_panel(bounds, option_count, height);
+    top + MENU_GUTTER + MENU_ROW * (index as f32 + 0.5)
+}
+
 fn picked_edits(
     shell: &Shell,
     picker_id: &'static str,
@@ -814,15 +802,14 @@ fn picked_edits(
     let center_y = bounds.y + bounds.height / 2.0;
     ui.point_at(iced::Point::new(center_x, center_y));
     ui.simulate(click());
-    let opens_below = WINDOW_HEIGHT - (bounds.y + bounds.height) > bounds.y;
-    let menu_top = if opens_below {
-        bounds.y + bounds.height
-    } else {
-        bounds.y - bounds.height * option_count as f32
-    };
     let option_position = iced::Point::new(
         center_x,
-        menu_top + bounds.height * (option_index as f32 + 0.5),
+        menu_row_y(
+            bounds,
+            option_count,
+            option_index,
+            window_settings().size.height,
+        ),
     );
     ui.point_at(option_position);
     ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved {
@@ -859,7 +846,7 @@ fn the_lift_off_picker_emits_each_options_edit() {
     }
 }
 
-// --- a pick empties the panes, the sidebar stays (review round 8) -----------------
+// --- a pick empties the panes, the sidebar stays -----------------
 
 #[test]
 fn a_pick_waiting_on_its_read_shows_the_picked_profile_and_loading_panes() {
@@ -874,8 +861,8 @@ fn a_pick_waiting_on_its_read_shows_the_picked_profile_and_loading_panes() {
     // profile 3 is the highlighted pick, profile 2 is not
     assert!(contains_id(&shell, "edited-profile"));
     assert!(contains_id(&shell, "profile-pick-2"));
-    // Make active is disabled with its reason
-    assert!(contains(&shell, "Make active"));
+    // Make 3 active is disabled with its reason
+    assert!(contains(&shell, "Make 3 active"));
     assert!(contains(&shell, "Reading the mouse"));
 }
 
@@ -891,8 +878,8 @@ fn a_pick_answered_asleep_shows_the_asleep_state_in_the_panes() {
     assert!(contains(&shell, "Model O Wireless"));
     assert!(contains_id(&shell, "edited-profile"));
     assert!(contains_id(&shell, "profile-pick-2"));
-    // Make active is disabled with the asleep reason
-    assert!(contains(&shell, "Make active"));
+    // Make 3 active is disabled with the asleep reason
+    assert!(contains(&shell, "Make 3 active"));
     assert!(contains(
         &shell,
         "The mouse is asleep; wake it to change the active profile"
@@ -1078,14 +1065,18 @@ fn a_two_line_failed_notice_capitalizes_every_line() {
     ));
 }
 
-/// The sidebar's battery with no reading is an `Unknown` tag, not prose.
+/// The sidebar's battery with no reading is an `Unknown` tag on the link's
+/// line, not prose and not a %.
 #[test]
 fn the_sidebar_battery_with_no_reading_is_an_unknown_tag() {
     let mut snap = snapshot();
     snap.battery.percent = None;
     let shell = shell(snap);
-    assert!(contains(&shell, "Battery"));
+    render_frame(&shell, "sidebar-battery-unknown");
+    assert!(contains(&shell, &eyebrow("Wireless")));
+    assert_eq!(count(&shell, "Unknown"), 1);
     assert!(lacks(&shell, "Battery unknown"));
+    assert!(lacks(&shell, "35%"));
 }
 
 /// The Device pane reads `file_blocked`, so an asleep mouse greys export and

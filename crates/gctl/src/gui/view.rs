@@ -7,30 +7,47 @@ use std::time::Duration;
 use iced::futures::StreamExt;
 use iced::futures::channel::mpsc;
 use iced::theme::Mode;
+use iced::time::Instant;
 use iced::widget::{
-    button, center, checkbox, column, container, pick_list, row, rule, scrollable, slider, space,
-    stack, text, text_input, toggler,
+    Float, center, checkbox, column, container, row, rule, scrollable, slider, space, stack, text,
+    text_input, toggler,
 };
-use iced::{Background, Border, Color, Element, Length, Size, Subscription, Task};
+use iced::{Background, Border, Color, Element, Length, Padding, Size, Subscription, Task, Vector};
 
 use gctl_proto::{Binding, Button, Device, Profile};
 
+use super::control::Control;
+use super::dropdown::{self, Dropdown};
 use super::io;
+use super::motion::{self, Curve, Ease, Key, Prefs};
 use super::state::{
     Connection, Edit, EffectKind, ImportCheck, Leave, LoadError, Msg, Notice, Prompt, Request,
     Section, Snapshot, State, WriteFailure, button_label,
 };
-use super::theme::{self, CONTROL_HEIGHT, MONO_FONT, Scheme, UI_FONT};
+use super::theme::{self, CONTROL_HEIGHT, MONO_FONT, Scheme, Tokens, UI_FONT};
 use crate::memory::Memory;
 use crate::parse;
 use crate::writes::WriteOp;
 
 /// The window's own message type, wrapping the state machine's `Msg`.
 #[derive(Debug, Clone)]
-enum Message {
+pub(crate) enum Message {
     Machine(Msg),
+    /// One redraw's instant: the shell's clock moves forward to here.
+    Frame(Instant),
     /// The desktop's colour scheme mode answered the boot query or changed.
     Theme(Mode),
+    /// The portal's (or GNOME's) reduced-motion flag.
+    Motion(bool),
+    /// kdeglobals' animation factor, read off the UI thread. `sequence` orders
+    /// the reads: a slow older answer never overwrites a newer one.
+    Kde {
+        sequence: u64,
+        factor: Option<f32>,
+    },
+    /// A window event; only a regained focus re-reads the desktop's motion
+    /// preference.
+    Window(iced::window::Event),
     Loaded {
         device: Option<DeviceHandle>,
         result: Result<Snapshot, LoadError>,
@@ -73,45 +90,482 @@ enum Message {
 type DeviceHandle = Arc<Mutex<Device<hidapi::HidDevice>>>;
 
 /// Everything the window carries besides the state machine: the opened device,
-/// the export/import path text, and the current colour scheme.
-struct Shell {
-    machine: State,
+/// the export/import path text, the current colour scheme and the motion.
+pub(crate) struct Shell {
+    pub(crate) machine: State,
     device: Option<DeviceHandle>,
     state_dir: Option<PathBuf>,
     lock_path: Option<PathBuf>,
     export_path: String,
     import_path: String,
-    scheme: Scheme,
+    pub(crate) scheme: Scheme,
+    pub(crate) motion: Motion,
 }
 
 #[derive(Clone)]
 struct Flags {
     state_dir: Option<PathBuf>,
     lock_path: Option<PathBuf>,
+    /// kdeglobals, resolved by `main`; `None` when the desktop has no KDE
+    /// configuration to read.
+    kdeglobals: Option<PathBuf>,
+}
+
+/// The shell's clock and the values it moves. The clock only ever advances,
+/// every animation starts at it, and the view reads it, never `Instant::now()`.
+pub(crate) struct Motion {
+    clock: Instant,
+    pub(crate) prefs: Prefs,
+    /// kdeglobals, resolved by `main`; its factor is read on the blocking pool.
+    pub(crate) kdeglobals: Option<PathBuf>,
+    /// The factor the last kdeglobals read answered, kept so a portal message
+    /// can re-derive the preference without reading the file again.
+    kde: Option<f32>,
+    /// The sequence number of the next kdeglobals read, and of the newest one
+    /// whose answer was applied: a slow older answer is dropped.
+    kde_reads: u64,
+    kde_applied: u64,
+    section_alpha: Ease,
+    section_rise: Ease,
+    segment: Ease,
+    dot: Ease,
+    active_dot: Ease,
+    /// The tint a control's state change eases: a section row's selection, a
+    /// segment's edited mark. One ease per key, so a fill lands with the mark
+    /// it belongs to instead of snapping ahead of it.
+    selection: std::collections::HashMap<Key, Ease>,
+    notice: Ghost,
+    changed: Ghost,
+    error: Ghost,
+    outside: Ghost,
+}
+
+/// The state a message started from, for the values its change animates.
+#[derive(Clone, Copy)]
+struct Before {
+    section: Section,
+    profile: Option<Profile>,
+    active: Option<Profile>,
+}
+
+impl Before {
+    fn of(machine: &State) -> Before {
+        Before {
+            section: machine.section(),
+            profile: machine.edit_profile(),
+            active: machine.snapshot().map(|snapshot| snapshot.active),
+        }
+    }
+}
+
+/// A line that leaves the state keeps being drawn while it fades out: the
+/// shell holds the last text and its fade; `gui::state` stays untouched.
+struct Ghost {
+    text: Option<String>,
+    /// A notice's tone: true is the success colour.
+    success: bool,
+    fade: Ease,
+}
+
+impl Ghost {
+    fn new() -> Ghost {
+        Ghost {
+            text: None,
+            success: false,
+            fade: Ease::settled(0.0),
+        }
+    }
+
+    /// Follows what the state draws now: a new text fades in, a gone one fades
+    /// out from the text it kept.
+    fn observe(&mut self, current: Option<(&str, bool)>, now: Instant, prefs: Prefs) {
+        match current {
+            Some((text, success)) => {
+                if self.text.as_deref() != Some(text)
+                    || self.success != success
+                    || self.fade.target() <= 0.0
+                {
+                    self.text = Some(text.to_owned());
+                    self.success = success;
+                    self.fade
+                        .start_from(0.0, 1.0, now, prefs.fade(motion::NEAR), Curve::EaseOut);
+                }
+            }
+            None => {
+                if self.text.is_some() && self.fade.target() > 0.0 {
+                    self.fade.start(
+                        0.0,
+                        now,
+                        prefs.fade(motion::exit(motion::NEAR)),
+                        Curve::Ease,
+                    );
+                }
+            }
+        }
+    }
+
+    fn visible(&self, now: Instant) -> Option<(&str, f32)> {
+        let alpha = self.fade.at(now);
+        let text = self.text.as_deref()?;
+        (alpha > 0.0).then_some((text, alpha))
+    }
+
+    fn animating(&self, now: Instant) -> bool {
+        self.fade.animating(now)
+    }
+}
+
+/// What one line draws now: the state's text, or the ghost's while it fades
+/// out. A text the shell never saw (a test mutating the machine directly)
+/// draws at full strength.
+fn ghost_line<'a>(
+    ghost: &'a Ghost,
+    current: Option<&'a str>,
+    now: Instant,
+) -> Option<(&'a str, f32)> {
+    match (current, ghost.visible(now)) {
+        (Some(text), Some((shown, alpha))) if shown == text => Some((text, alpha)),
+        (Some(text), _) => Some((text, 1.0)),
+        (None, Some((shown, alpha))) => Some((shown, alpha)),
+        (None, None) => None,
+    }
+}
+
+/// The notice's shape of `ghost_line`, which also carries its tone.
+fn ghost_notice<'a>(
+    ghost: &'a Ghost,
+    current: Option<(&'a str, bool)>,
+    now: Instant,
+) -> Option<(&'a str, bool, f32)> {
+    match (current, ghost.visible(now)) {
+        (Some((text, success)), Some((shown, alpha))) if shown == text => {
+            Some((text, success, alpha))
+        }
+        (Some((text, success)), _) => Some((text, success, 1.0)),
+        (None, Some((shown, alpha))) => Some((shown, ghost.success, alpha)),
+        (None, None) => None,
+    }
+}
+
+impl Motion {
+    fn new(machine: &State, kdeglobals: Option<PathBuf>) -> Motion {
+        Motion {
+            clock: Instant::now(),
+            prefs: Prefs::default(),
+            kdeglobals,
+            kde: None,
+            kde_reads: 0,
+            kde_applied: 0,
+            section_alpha: Ease::settled(1.0),
+            section_rise: Ease::settled(0.0),
+            segment: Ease::settled(segment_offset(profile_index(machine))),
+            dot: Ease::settled(dot_offset(section_index(machine.section()))),
+            active_dot: Ease::settled(active_dot_offset(active_index(machine))),
+            selection: std::collections::HashMap::new(),
+            notice: Ghost::new(),
+            changed: Ghost::new(),
+            error: Ghost::new(),
+            outside: Ghost::new(),
+        }
+    }
+
+    /// Moves the clock forward; it never winds back.
+    fn advance(&mut self, at: Instant) {
+        self.clock = self.clock.max(at);
+    }
+
+    pub(crate) fn now(&self) -> Instant {
+        self.clock
+    }
+
+    /// A control's state tint at the clock, `current` when it never moved.
+    pub(crate) fn selection_at(&self, key: Key, current: bool, now: Instant) -> f32 {
+        self.selection
+            .get(&key)
+            .map(|ease| ease.at(now))
+            .unwrap_or(if current { 1.0 } else { 0.0 })
+    }
+
+    /// Under an open prompt the sliding marks and the cards' rise go straight
+    /// to their targets, so a mark that moved under the prompt is at its new
+    /// place the moment it closes instead of jumping back into a slide.
+    fn settle_marks(&mut self, machine: &State) {
+        self.segment = Ease::settled(segment_offset(profile_index(machine)));
+        self.dot = Ease::settled(dot_offset(section_index(machine.section())));
+        self.active_dot = Ease::settled(active_dot_offset(active_index(machine)));
+        self.section_rise = Ease::settled(0.0);
+    }
+
+    /// Takes the factor kdeglobals answered, keeping the portal's flag. An
+    /// answer older than the newest one applied is dropped.
+    fn set_kde(&mut self, sequence: u64, kde: Option<f32>) {
+        if sequence <= self.kde_applied {
+            return;
+        }
+        self.kde_applied = sequence;
+        self.kde = kde;
+        self.prefs = Prefs::from_desktop(self.prefs.reduce, kde);
+    }
+
+    fn set_reduce(&mut self, reduce: bool) {
+        self.prefs = Prefs::from_desktop(reduce, self.kde);
+    }
+
+    /// Starts the motion a message's state change asks for.
+    fn after(&mut self, machine: &State, before: Before) {
+        let now = self.clock;
+        if machine.section() != before.section {
+            self.section_alpha.start_from(
+                0.0,
+                1.0,
+                now,
+                self.prefs.fade(motion::FAR),
+                Curve::EaseOut,
+            );
+            if let Some(duration) = self.prefs.travel(motion::NEAR) {
+                self.section_rise
+                    .start_from(RISE, 0.0, now, duration, Curve::EaseOut);
+            } else {
+                self.section_rise = Ease::settled(0.0);
+            }
+            if let Some(duration) = self.prefs.travel(motion::SLIDE) {
+                self.dot.start(
+                    dot_offset(section_index(machine.section())),
+                    now,
+                    duration,
+                    Curve::Slide,
+                );
+            } else {
+                self.dot = Ease::settled(dot_offset(section_index(machine.section())));
+            }
+            // The row's fill and label land on the tint's ladder, with the
+            // mark that moved to them.
+            for index in 0..4 {
+                self.selection
+                    .entry(Key::SectionRow(index))
+                    .or_insert_with(|| Ease::settled(0.0))
+                    .start(
+                        if index == section_index(machine.section()) {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        now,
+                        self.prefs.fade(motion::TINT),
+                        Curve::Ease,
+                    );
+            }
+        }
+        // The first profile the mouse reports settles the marks where the
+        // window draws them; only a change from one known profile to another
+        // slides.
+        match (before.profile, machine.edit_profile()) {
+            (None, Some(_)) => {
+                self.segment = Ease::settled(segment_offset(profile_index(machine)));
+            }
+            (Some(before), Some(after)) if before != after => {
+                if let Some(duration) = self.prefs.travel(motion::SLIDE) {
+                    self.segment.start(
+                        segment_offset(profile_index(machine)),
+                        now,
+                        duration,
+                        Curve::Slide,
+                    );
+                } else {
+                    self.segment = Ease::settled(segment_offset(profile_index(machine)));
+                }
+                // The digit's colour eases onto the capsule that slides under
+                // it, so the mark and its digit change together.
+                for profile in Profile::all() {
+                    self.selection
+                        .entry(Key::Segment(profile.get()))
+                        .or_insert_with(|| Ease::settled(0.0))
+                        .start(
+                            if machine.edit_profile() == Some(profile) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            now,
+                            self.prefs.fade(motion::TINT),
+                            Curve::Ease,
+                        );
+                }
+            }
+            _ => {}
+        }
+        let active = machine.snapshot().map(|snapshot| snapshot.active);
+        if active != before.active {
+            let offset = active_dot_offset(profile_slot(active));
+            if before.active.is_none() {
+                self.active_dot = Ease::settled(offset);
+            } else if let Some(duration) = self.prefs.travel(motion::SLIDE) {
+                self.active_dot.start(offset, now, duration, Curve::Slide);
+            } else {
+                self.active_dot = Ease::settled(offset);
+            }
+        }
+    }
+
+    pub(crate) fn animating(&self) -> bool {
+        let now = self.clock;
+        self.section_alpha.animating(now)
+            || self.section_rise.animating(now)
+            || self.segment.animating(now)
+            || self.dot.animating(now)
+            || self.active_dot.animating(now)
+            || self.selection.values().any(|ease| ease.animating(now))
+            || self.notice.animating(now)
+            || self.changed.animating(now)
+            || self.error.animating(now)
+            || self.outside.animating(now)
+    }
+}
+
+/// How far the cards start below their resting place when a section opens.
+const RISE: f32 = 6.0;
+
+fn section_index(section: Section) -> usize {
+    match section {
+        Section::Performance => 0,
+        Section::Lighting => 1,
+        Section::Buttons => 2,
+        Section::Device => 3,
+    }
+}
+
+fn profile_slot(profile: Option<Profile>) -> usize {
+    profile
+        .map(|profile| usize::from(profile.get().saturating_sub(1)))
+        .unwrap_or(0)
+}
+
+fn profile_index(machine: &State) -> usize {
+    profile_slot(machine.edit_profile())
+}
+
+fn active_index(machine: &State) -> usize {
+    profile_slot(machine.snapshot().map(|snapshot| snapshot.active))
+}
+
+/// The left offset of the active-profile dot under segment `index`.
+fn active_dot_offset(index: usize) -> f32 {
+    TRACK_PADDING + index as f32 * (SEGMENT_WIDTH + SEGMENT_GAP) + (SEGMENT_WIDTH - DOT_SIZE) / 2.0
 }
 
 impl Shell {
-    fn boot(flags: Flags) -> (Shell, Task<Message>) {
-        let (machine, requests) = State::new();
-        let mut shell = Shell {
+    /// A shell over `machine` with no device, no paths, the dark scheme, no
+    /// motion preference from the desktop and nothing animating.
+    pub(crate) fn new(machine: State) -> Shell {
+        Shell {
+            motion: Motion::new(&machine, None),
             machine,
             device: None,
-            state_dir: flags.state_dir,
-            lock_path: flags.lock_path,
+            state_dir: None,
+            lock_path: None,
             export_path: String::new(),
             import_path: String::new(),
             scheme: Scheme::Dark,
-        };
+        }
+    }
+
+    fn boot(flags: Flags) -> (Shell, Task<Message>) {
+        let (machine, requests) = State::new();
+        let mut shell = Shell::new(machine);
+        shell.motion = Motion::new(&shell.machine, flags.kdeglobals);
+        shell.state_dir = flags.state_dir;
+        shell.lock_path = flags.lock_path;
         let mut task = shell.run_requests(requests);
         // The desktop's mode answers asynchronously; dark holds until it does.
-        task = Task::batch([task, iced::system::theme().map(Message::Theme)]);
+        task = Task::batch([
+            task,
+            iced::system::theme().map(Message::Theme),
+            shell.kde_task(),
+        ]);
         (shell, task)
     }
 
-    fn update(&mut self, message: Message) -> Task<Message> {
+    /// Reads kdeglobals' animation factor off the UI thread; `Task::none` when
+    /// the desktop has no file to read. Each read carries the next sequence
+    /// number, so an older answer that arrives late is dropped.
+    fn kde_task(&mut self) -> Task<Message> {
+        let Some(path) = self.motion.kdeglobals.clone() else {
+            return Task::none();
+        };
+        self.motion.kde_reads += 1;
+        let sequence = self.motion.kde_reads;
+        Task::perform(
+            async move {
+                spawn(move || motion::kde_factor_file(&path))
+                    .await
+                    .ok()
+                    .flatten()
+            },
+            move |factor| Message::Kde { sequence, factor },
+        )
+    }
+
+    /// Advances the machine and starts the motion its change asks for. Every
+    /// mutation goes through here, so no animation can miss its message.
+    fn machine_update(&mut self, message: Msg) -> Vec<Request> {
+        let before = Before::of(&self.machine);
+        let requests = self.machine.update(message);
+        self.motion.after(&self.machine, before);
+        // The base layer draws at rest under a prompt, its marks included.
+        if self.machine.prompt().is_some() {
+            self.motion.settle_marks(&self.machine);
+        }
+        self.sync_ghosts();
+        requests
+    }
+
+    /// Follows the lines the state draws now, so a line that leaves keeps its
+    /// last text through its exit fade.
+    fn sync_ghosts(&mut self) {
+        let now = self.motion.now();
+        let prefs = self.motion.prefs;
+        let notice = self.machine.notice().map(|notice| match notice {
+            Notice::Done(message) => (message.as_str(), true),
+            Notice::Failed(message) => (message.as_str(), false),
+        });
+        let error = self.machine.error().map(|error| (error, false));
+        let outside = self
+            .machine
+            .outside_change()
+            .then_some((OUTSIDE_BANNER, false));
+        let changed = {
+            let lines = self.machine.changed();
+            (!lines.is_empty()).then(|| (lines.join("\n"), true))
+        };
+        self.motion.notice.observe(notice, now, prefs);
+        self.motion.error.observe(error, now, prefs);
+        self.motion.outside.observe(outside, now, prefs);
+        self.motion.changed.observe(
+            changed.as_ref().map(|(text, ok)| (text.as_str(), *ok)),
+            now,
+            prefs,
+        );
+    }
+
+    pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
+        self.motion.advance(match &message {
+            Message::Frame(at) => *at,
+            _ => Instant::now(),
+        });
         match message {
+            Message::Frame(_) => Task::none(),
+            Message::Motion(reduce) => {
+                self.motion.set_reduce(reduce);
+                Task::none()
+            }
+            Message::Kde { sequence, factor } => {
+                self.motion.set_kde(sequence, factor);
+                Task::none()
+            }
+            Message::Window(iced::window::Event::Focused) => self.kde_task(),
+            Message::Window(_) => Task::none(),
             Message::Machine(message) => {
-                let requests = self.machine.update(message);
+                let requests = self.machine_update(message);
                 self.run_requests(requests)
             }
             Message::Theme(mode) => {
@@ -120,7 +574,7 @@ impl Shell {
             }
             Message::Loaded { device, result } => {
                 self.device = device;
-                let requests = self.machine.update(Msg::Loaded(result));
+                let requests = self.machine_update(Msg::Loaded(result));
                 self.run_requests(requests)
             }
             Message::Applied {
@@ -130,7 +584,7 @@ impl Shell {
                 remembered,
             } => {
                 self.device = device;
-                let requests = self.machine.update(Msg::Applied {
+                let requests = self.machine_update(Msg::Applied {
                     error,
                     snapshot,
                     remembered,
@@ -139,7 +593,7 @@ impl Shell {
             }
             Message::Exported { device, result } => {
                 self.device = device;
-                let requests = self.machine.update(Msg::Exported(result));
+                let requests = self.machine_update(Msg::Exported(result));
                 self.run_requests(requests)
             }
             Message::Imported {
@@ -151,7 +605,7 @@ impl Shell {
                 remembered,
             } => {
                 self.device = device;
-                let requests = self.machine.update(Msg::Imported {
+                let requests = self.machine_update(Msg::Imported {
                     error,
                     written,
                     reached,
@@ -188,10 +642,22 @@ impl Shell {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let frames = if self.motion.animating() {
+            iced::window::frames().map(Message::Frame)
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
             iced::time::every(tick_interval(self.machine.connection()))
                 .map(|_| Message::Machine(Msg::Tick)),
             iced::system::theme_changes().map(Message::Theme),
+            iced::window::events().map(|(_id, event)| Message::Window(event)),
+            frames,
+            Subscription::run(|| {
+                mundy::Preferences::stream(mundy::Interest::ReducedMotion).map(|prefs| {
+                    Message::Motion(prefs.reduced_motion == mundy::ReducedMotion::Reduce)
+                })
+            }),
         ])
     }
 
@@ -640,16 +1106,25 @@ pub(super) fn window_settings() -> iced::window::Settings {
     settings
 }
 
-/// Starts the window. `state_dir` and `lock_path` come from `main`.
-pub fn run(state_dir: Option<&Path>, lock_path: Option<PathBuf>) -> iced::Result {
+/// Starts the window. `state_dir`, `lock_path` and `kdeglobals` come from
+/// `main`, which is the only reader of environment variables.
+pub fn run(
+    state_dir: Option<&Path>,
+    lock_path: Option<PathBuf>,
+    kdeglobals: Option<PathBuf>,
+) -> iced::Result {
     let flags = Flags {
         state_dir: state_dir.map(Path::to_path_buf),
         lock_path,
+        kdeglobals,
     };
     let boot = move || Shell::boot(flags.clone());
     iced::application(boot, Shell::update, Shell::view)
         .theme(|shell: &Shell| shell.theme())
         .subscription(Shell::subscription)
+        .default_font(UI_FONT)
+        .font(theme::FONTS[0])
+        .font(theme::FONTS[1])
         .window(window_settings())
         .title("gctl")
         .run()
@@ -666,19 +1141,84 @@ fn tick_interval(connection: Connection) -> Duration {
 
 // --- the view -----------------------------------------------------------------
 
+/// The sidebar's fixed width.
+const SIDEBAR_WIDTH: f32 = 220.0;
+/// The gap above each sidebar eyebrow group, from the rhythm scale's heading
+/// step: an eyebrow opens a group, so it takes the 24 px above an h4. The 16 px
+/// flow gap is already the row rhythm, and 32/40 px belong to a page column.
+const SIDEBAR_GROUP_GAP: f32 = 24.0;
+/// The outside-change banner's one text, shared by the live banner and the
+/// ghost it leaves while it fades out.
+const OUTSIDE_BANNER: &str = "The mouse was changed outside this window. Values marked \"Last set by gctl\" may be out of date.";
+/// The sidebar's inner padding; the header, the eyebrows, the profile track and
+/// the section dot all share the content edge it leaves.
+const SIDEBAR_PADDING: f32 = 12.0;
+
+/// One profile segment, and the gutter between two of them.
+const SEGMENT_WIDTH: f32 = 52.0;
+const SEGMENT_HEIGHT: f32 = 30.0;
+const SEGMENT_GAP: f32 = 1.0;
+/// The track's inner gutter, so the selected capsule never touches its frame.
+const TRACK_PADDING: f32 = 4.0;
+const TRACK_WIDTH: f32 = 3.0 * SEGMENT_WIDTH + 2.0 * SEGMENT_GAP + 2.0 * TRACK_PADDING;
+const TRACK_HEIGHT: f32 = SEGMENT_HEIGHT + 2.0 * TRACK_PADDING;
+
+/// The one dot that marks the open section, and the gutter it lives in.
+const DOT_SIZE: f32 = 6.0;
+const DOT_COLUMN: f32 = 18.0;
+const SECTION_ROW_HEIGHT: f32 = 34.0;
+const SECTION_ROW_GAP: f32 = 2.0;
+const SECTION_ROW_PITCH: f32 = SECTION_ROW_HEIGHT + SECTION_ROW_GAP;
+
+/// The link line's fixed height: the battery tag is taller than the meter, so
+/// the line holds one height and the profile group below never shifts.
+const LINK_LINE_HEIGHT: f32 = 20.0;
+
+/// The shared width of the Performance pane's single-value controls.
+const VALUE_CONTROL_WIDTH: f32 = 150.0;
+/// A stage's colour field.
+const HEX_WIDTH: f32 = 80.0;
+const EYEBROW_SIZE: f32 = 11.0;
+
+/// The left offset of the selected segment's capsule at `index`.
+fn segment_offset(index: usize) -> f32 {
+    TRACK_PADDING + index as f32 * (SEGMENT_WIDTH + SEGMENT_GAP)
+}
+
+/// The top offset of the section dot at `index`.
+fn dot_offset(index: usize) -> f32 {
+    index as f32 * SECTION_ROW_PITCH + (SECTION_ROW_HEIGHT - DOT_SIZE) / 2.0
+}
+
+/// One pane's paint: the scheme, the alpha its cards fade at, and how far they
+/// have risen. iced has no subtree opacity, so every style and text colour the
+/// pane paints carries this alpha.
+#[derive(Clone, Copy)]
+struct Look {
+    scheme: Scheme,
+    alpha: f32,
+    rise: f32,
+}
+
+impl Look {
+    fn tokens(self) -> Tokens {
+        self.scheme.tokens().scale_alpha(self.alpha)
+    }
+}
+
 impl Shell {
     /// The iced theme this shell's scheme carries; `run` hands it to iced.
-    fn theme(&self) -> iced::Theme {
+    pub(crate) fn theme(&self) -> iced::Theme {
         self.scheme.theme()
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    pub(crate) fn view(&self) -> Element<'_, Message> {
         self.render(self.scheme)
     }
 
     /// The whole window under one scheme, shared by the live window and the
     /// two-theme render tests.
-    fn render(&self, scheme: Scheme) -> Element<'_, Message> {
+    pub(crate) fn render(&self, scheme: Scheme) -> Element<'_, Message> {
         let base: Element<'_, Message> = match self.machine.connection() {
             Connection::Loading => center(ui_text("Loading")).into(),
             Connection::NoMouse => empty_state(
@@ -720,39 +1260,40 @@ impl Shell {
     fn modal(&self, scheme: Scheme) -> Option<Element<'_, Message>> {
         let prompt = self.machine.prompt()?;
         let content = match &prompt {
-            Prompt::Discard(_) => discard_prompt(scheme, prompt, self.machine.section()),
-            Prompt::Import(_) => import_prompt(scheme, prompt),
+            Prompt::Discard(_) => discard_prompt(scheme, self, prompt, self.machine.section()),
+            Prompt::Import(_) => import_prompt(scheme, self, prompt),
         };
         Some(opaque_modal(scheme, content))
     }
 
     fn main_view(&self, scheme: Scheme) -> Element<'_, Message> {
-        let machine = &self.machine;
         let t = scheme.tokens();
-        let error_banner = machine.error().map(|error| {
-            container(ui_text(capitalize(error)).size(13).color(t.danger_text))
-                .style(theme::banner(scheme))
-                .width(Length::Fill)
-                .padding([8.0, 12.0])
-        });
-        let outside_banner = machine.outside_change().then(|| {
+        let now = self.motion.now();
+        let error_banner =
+            ghost_line(&self.motion.error, self.machine.error(), now).map(|(text, alpha)| {
+                let fading = t.scale_alpha(alpha);
+                container(ui_text(capitalize(text)).size(13).color(fading.danger_text))
+                    .style(theme::banner_at(fading))
+                    .width(Length::Fill)
+                    .padding([8.0, 12.0])
+            });
+        let outside = self.machine.outside_change().then_some(OUTSIDE_BANNER);
+        let outside_banner = ghost_line(&self.motion.outside, outside, now).map(|(text, alpha)| {
+            let fading = t.scale_alpha(alpha);
+            let dismiss = self
+                .control(control_label("Dismiss"), theme::warning_surface(fading))
+                .height(CONTROL_HEIGHT)
+                .on_press(Message::Machine(Msg::DismissOutsideChange));
             container(
                 row![
-                    ui_text(
-                        "The mouse was changed outside this window. Values marked \"Last set by gctl\" may be out of date."
-                    )
-                    .size(13)
-                    .color(t.warning),
+                    ui_text(text).size(13).color(fading.warning),
                     space().width(Length::Fill),
-                    button(control_label("Dismiss"))
-                        .style(theme::warning_button(scheme))
-                        .height(CONTROL_HEIGHT)
-                        .on_press(Message::Machine(Msg::DismissOutsideChange)),
+                    dismiss,
                 ]
                 .spacing(12)
                 .align_y(iced::Alignment::Center),
             )
-            .style(theme::banner_warning(scheme))
+            .style(theme::banner_warning_at(fading))
             .width(Length::Fill)
             .padding([8.0, 12.0])
         });
@@ -772,152 +1313,304 @@ impl Shell {
         let machine = &self.machine;
         let t = scheme.tokens();
         let Some(snap) = machine.snapshot() else {
-            return container(space()).width(220).into();
+            return container(space()).width(SIDEBAR_WIDTH).into();
         };
 
         // The badge wraps under the model name, so the longest model name never
         // clips it against the fixed sidebar width.
-        let mut model_row =
-            column![ui_text(snap.model.name).size(18)].align_x(iced::Alignment::Start);
+        let mut model_row = column![ui_text(snap.model.name).size(18).color(t.text)]
+            .align_x(iced::Alignment::Start);
         if !snap.model.tested {
             model_row = model_row.push(warning_tag(scheme, "Untested")).spacing(4);
         }
 
-        let battery: Element<'_, Message> = match snap.battery.percent {
-            Some(percent) => ui_text(format!("Battery {percent}%"))
-                .size(13)
-                .color(t.text_2)
-                .into(),
-            None => row![
-                ui_text("Battery").size(13).color(t.text_2),
-                tag(scheme, "Unknown"),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .into(),
-        };
         let link = match snap.model.link {
             gctl_proto::Link::Wired => "Wired",
             gctl_proto::Link::Wireless => "Wireless",
         };
-
-        let edit_profile = machine.edit_profile();
-        let pick_blocked = machine.pick_blocked();
-        let profiles = row(Profile::all().into_iter().map(|profile| {
-            let is_edited = edit_profile == Some(profile);
-            let id = if is_edited {
-                "edited-profile".to_owned()
-            } else {
-                format!("profile-pick-{}", profile.get())
-            };
-            let mut pick = button(ui_text(profile.get().to_string()).size(13))
-                .style(theme::quiet_button(scheme))
-                .width(30)
-                .height(30);
-            if is_edited {
-                pick = pick.style(theme::pick_selected(scheme));
-            }
-            if pick_blocked.is_none() {
-                pick = pick.on_press(Message::Machine(Msg::PickProfile(profile)));
-            }
-            container(pick).id(id).into()
-        }))
-        .spacing(4);
-        let edit_row = row![ui_text("Edit").size(12).color(t.text_3), profiles]
+        let battery: Element<'_, Message> = match snap.battery.percent {
+            Some(percent) => row![
+                ui_text(format!("{percent}%"))
+                    .size(12)
+                    .font(MONO_FONT)
+                    .color(t.text_2),
+                battery_meter(scheme, percent),
+            ]
             .spacing(8)
-            .align_y(iced::Alignment::Center);
+            .align_y(iced::Alignment::Center)
+            .into(),
+            None => tag(
+                Look {
+                    scheme,
+                    alpha: 1.0,
+                    rise: 0.0,
+                },
+                "Unknown",
+            ),
+        };
+        // One fixed height whether the line shows the meter or the `Unknown`
+        // tag: the taller tag would otherwise push the profile group down.
+        let battery_line = container(
+            row![
+                ui_text(eyebrow(link)).size(EYEBROW_SIZE).color(t.text_4),
+                battery,
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .height(LINK_LINE_HEIGHT)
+        .align_y(iced::Alignment::Center);
 
-        let show_make_active = edit_profile.is_some() && edit_profile != Some(snap.active);
-        let mut active_area = column![
-            ui_text(format!("Active profile: {}", snap.active.get()))
-                .size(12)
-                .color(t.text_2),
-        ]
-        .align_x(iced::Alignment::Start);
+        let edited = machine.edit_profile();
+        let segments = self.profile_segments(scheme);
+
+        let show_make_active = edited.is_some() && edited != Some(snap.active);
+        let mut active_area = column![].spacing(4);
         if show_make_active {
+            let name = edited.unwrap_or(snap.active).get();
             let blocked = machine.make_active_blocked();
-            let mut b = button(control_label("Make active"))
-                .style(theme::primary_button(scheme))
-                .height(CONTROL_HEIGHT);
+            let mut control = self
+                .control(
+                    control_label(format!("Make {name} active")),
+                    theme::primary_surface(*t),
+                )
+                .height(CONTROL_HEIGHT)
+                .disabled(blocked.is_some());
             if blocked.is_none() {
-                b = b.on_press(Message::Machine(Msg::MakeActive));
+                control = control.on_press(Message::Machine(Msg::MakeActive));
             }
-            active_area = active_area.push(b);
+            active_area = active_area.push(control);
             if let Some(reason) = blocked {
                 active_area =
                     active_area.push(ui_text(capitalize(&reason)).size(11).color(t.text_3));
             }
         }
-        let active_area = active_area.spacing(4);
 
-        let sections = column(
-            [
-                Section::Performance,
-                Section::Lighting,
-                Section::Buttons,
-                Section::Device,
-            ]
-            .into_iter()
-            .map(|section| self.section_row(scheme, section)),
-        )
-        .spacing(2);
-
-        let sidebar = column![
-            model_row,
-            battery,
-            ui_text(link).size(13).color(t.text_3),
-            edit_row,
-            active_area,
-            rule::horizontal(1).style(theme::rule(scheme)),
-            sections,
+        // The header, the profile group and the settings group read as three
+        // groups: each eyebrow opens its group with the rhythm's heading gap.
+        let header = column![model_row, battery_line].spacing(8);
+        let mut profile_group = column![
+            ui_text(eyebrow("Profile"))
+                .size(EYEBROW_SIZE)
+                .color(t.text_4),
+            segments,
+            self.active_profile_dot(scheme, snap.active),
         ]
-        .spacing(8)
-        .padding(12);
-        container(sidebar)
-            .width(220)
+        .spacing(8);
+        if show_make_active {
+            profile_group = profile_group.push(active_area);
+        }
+        let settings_group = column![
+            ui_text(eyebrow("Settings"))
+                .size(EYEBROW_SIZE)
+                .color(t.text_4),
+            self.section_rows(scheme),
+        ]
+        .spacing(8);
+        let body = column![header, profile_group, settings_group].spacing(SIDEBAR_GROUP_GAP);
+
+        container(body.padding(SIDEBAR_PADDING))
+            .width(SIDEBAR_WIDTH)
             .style(theme::sidebar(scheme))
             .height(Length::Fill)
             .into()
     }
 
-    fn section_row(&self, scheme: Scheme, section: Section) -> Element<'_, Message> {
-        let machine = &self.machine;
+    /// The dot under the active profile's segment, sliding when the active
+    /// profile moves.
+    fn active_profile_dot(&self, scheme: Scheme, active: Profile) -> Element<'_, Message> {
         let t = scheme.tokens();
-        let current = section == machine.section();
-        let label = format!(
-            "{}{}",
-            section_label(section),
-            if machine.pending(section) { " •" } else { "" }
-        );
+        let now = self.motion.now();
+        let base = active_dot_offset(profile_slot(Some(active)));
+        let offset = if self.base_moves() && self.motion.active_dot.animating(now) {
+            self.motion.active_dot.at(now)
+        } else {
+            base
+        };
         let dot = container(space())
-            .width(6)
-            .height(6)
+            .width(DOT_SIZE)
+            .height(DOT_SIZE)
+            .id("active-profile-dot")
             .style(move |_theme| container::Style {
-                background: Some(Background::Color(if current {
-                    t.accent
-                } else {
-                    Color::TRANSPARENT
-                })),
+                background: Some(Background::Color(t.accent)),
                 border: Border {
                     radius: 999.0.into(),
                     ..Border::default()
                 },
                 ..container::Style::default()
             });
-        let row = row![
-            dot,
-            ui_text(label)
-                .size(13)
-                .color(if current { t.accent_text } else { t.text }),
-        ]
-        .padding([6, 10])
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
-        button(row)
-            .style(theme::quiet_button(scheme))
-            .on_press(Message::Machine(Msg::Select(section)))
-            .width(Length::Fill)
+        let dot = container(dot)
+            .width(TRACK_WIDTH)
+            .height(DOT_SIZE)
+            .padding(Padding {
+                top: 0.0,
+                left: base,
+                right: 0.0,
+                bottom: 0.0,
+            });
+        let shift = offset - base;
+        Float::new(dot)
+            .translate(move |_, _| Vector::new(shift, 0.0))
             .into()
+    }
+
+    /// The one segmented profile control: a framed track, three equal segments,
+    /// and one capsule sliding under the selected digit.
+    fn profile_segments(&self, scheme: Scheme) -> Element<'_, Message> {
+        let machine = &self.machine;
+        let t = scheme.tokens();
+        let edited = machine.edit_profile();
+        let blocked = machine.pick_blocked();
+        let now = self.motion.now();
+        // The capsule's slide is a transform, never layout: its resting place
+        // is the drawn segment's, and it only leaves it while it moves.
+        let base = segment_offset(profile_index(machine));
+        let offset = if self.base_moves() && self.motion.segment.animating(now) {
+            self.motion.segment.at(now)
+        } else {
+            base
+        };
+
+        let track = container(space())
+            .width(TRACK_WIDTH)
+            .height(TRACK_HEIGHT)
+            .style(theme::segment_track(scheme));
+        let capsule = container(
+            container(space())
+                .width(SEGMENT_WIDTH)
+                .height(SEGMENT_HEIGHT)
+                .style(theme::segment_selected(scheme)),
+        )
+        .width(TRACK_WIDTH)
+        .height(TRACK_HEIGHT)
+        .padding(Padding {
+            top: TRACK_PADDING,
+            left: base,
+            right: 0.0,
+            bottom: 0.0,
+        });
+        let shift = offset - base;
+        let capsule: Element<'_, Message> = Float::new(capsule)
+            .translate(move |_, _| Vector::new(shift, 0.0))
+            .into();
+        let cells = row(Profile::all().into_iter().map(|profile| {
+            let is_edited = edited == Some(profile);
+            let id = if is_edited {
+                "edited-profile".to_owned()
+            } else {
+                format!("profile-pick-{}", profile.get())
+            };
+            let key = Key::Segment(profile.get());
+            // The digit's tone eases with the capsule that slides under it, so
+            // the mark and its digit change together.
+            let tint = self.motion.selection_at(key, is_edited, now);
+            let colour = theme::mix(t.text_2, t.accent_text, tint);
+            let face = container(ui_text(profile.get().to_string()).size(13).color(colour))
+                .width(SEGMENT_WIDTH)
+                .height(SEGMENT_HEIGHT)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .id(id);
+            // The selected cell keeps its capsule; only the other two fade a
+            // hover surface over the track.
+            let mut cell = self
+                .control(face, theme::segment_surface(*t, !is_edited))
+                .padding(0)
+                .width(SEGMENT_WIDTH)
+                .height(SEGMENT_HEIGHT)
+                .disabled(blocked.is_some());
+            if blocked.is_none() {
+                cell = cell.on_press(Message::Machine(Msg::PickProfile(profile)));
+            }
+            Element::from(cell)
+        }))
+        .spacing(SEGMENT_GAP);
+        let cells = container(cells)
+            .width(TRACK_WIDTH)
+            .height(TRACK_HEIGHT)
+            .padding(Padding {
+                top: TRACK_PADDING,
+                left: TRACK_PADDING,
+                right: 0.0,
+                bottom: 0.0,
+            });
+
+        stack![track, capsule, cells].into()
+    }
+
+    /// The settings rows under one dot that slides to the open section.
+    fn section_rows(&self, scheme: Scheme) -> Element<'_, Message> {
+        let machine = &self.machine;
+        let t = scheme.tokens();
+        let now = self.motion.now();
+        let sections = [
+            Section::Performance,
+            Section::Lighting,
+            Section::Buttons,
+            Section::Device,
+        ];
+        let rows: Vec<Element<'_, Message>> = sections
+            .into_iter()
+            .enumerate()
+            .map(|(index, section)| {
+                let current = section == machine.section();
+                let label = format!(
+                    "{}{}",
+                    section_label(section),
+                    if machine.pending(section) { " •" } else { "" }
+                );
+                let key = Key::SectionRow(index);
+                // The open row's fill and label ease onto the new section, so
+                // they land with the dot that slides to them.
+                let selected = self.motion.selection_at(key, current, now);
+                let content = container(
+                    row![
+                        space().width(DOT_COLUMN),
+                        ui_text(label)
+                            .size(13)
+                            .color(theme::mix(t.text, t.accent_text, selected)),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                )
+                .height(SECTION_ROW_HEIGHT)
+                .center_y(Length::Fill)
+                .align_x(iced::Alignment::Start);
+                let row = self
+                    .control(content, theme::nav_surface(*t, selected))
+                    .padding(0)
+                    .width(Length::Fill)
+                    .height(SECTION_ROW_HEIGHT)
+                    .on_press(Message::Machine(Msg::Select(section)));
+                row.into()
+            })
+            .collect();
+        let rows = column(rows).spacing(SECTION_ROW_GAP).width(Length::Fill);
+
+        let base = dot_offset(section_index(machine.section()));
+        let dot_at = if self.base_moves() && self.motion.dot.animating(now) {
+            self.motion.dot.at(now)
+        } else {
+            base
+        };
+        let dot = container(space())
+            .width(DOT_SIZE)
+            .height(DOT_SIZE)
+            .id("section-dot")
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(t.accent)),
+                border: Border {
+                    radius: 999.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            });
+        let dot = column![space().height(base), dot];
+        let shift = dot_at - base;
+        let dot: Element<'_, Message> = Float::new(dot)
+            .translate(move |_, _| Vector::new(0.0, shift))
+            .into();
+
+        stack![rows, dot].into()
     }
 
     fn content_pane(&self, scheme: Scheme) -> Element<'_, Message> {
@@ -938,46 +1631,60 @@ impl Shell {
         }
         let machine = &self.machine;
         let section = machine.section();
-        let body = match section {
-            Section::Performance => self.performance_pane(scheme),
-            Section::Lighting => self.lighting_pane(scheme),
-            Section::Buttons => self.buttons_pane(scheme),
-            Section::Device => self.device_pane(scheme),
+        let look = Look {
+            scheme,
+            alpha: self.motion.section_alpha.at(self.motion.now()),
+            rise: self.motion.section_rise.at(self.motion.now()),
         };
+        let body = match section {
+            Section::Performance => self.performance_pane(look),
+            Section::Lighting => self.lighting_pane(look),
+            Section::Buttons => self.buttons_pane(look),
+            Section::Device => self.device_pane(look),
+        };
+        let cards = scrollable(container(body).padding([12.0, 16.0]))
+            .style(theme::scrollable_at(look.tokens()))
+            .height(Length::Fill);
+        // The rise is a transform, never layout: the cards' hit boxes ride with
+        // them, and at rest the float draws inline. Under a prompt it settles
+        // to its place, so it never paints above the scrim.
+        let rise = if self.base_moves() { look.rise } else { 0.0 };
+        let cards: Element<'_, Message> = Float::new(cards)
+            .translate(move |_, _| Vector::new(0.0, rise))
+            .into();
         if section == Section::Device {
-            return scrollable(container(body).padding([12, 16]))
-                .style(theme::scrollable(scheme))
-                .into();
+            return cards;
         }
         let blocked = machine.apply_blocked();
         let nothing_pending = !machine.pending(section);
-        let apply: Element<'_, Message> = {
-            let mut b = button(control_label("Apply"))
-                .style(theme::filled_button(scheme))
-                .height(CONTROL_HEIGHT);
+        let apply: Control<'_, Message> = {
+            let mut control = self
+                .control(
+                    control_label("Apply"),
+                    theme::filled_surface(*scheme.tokens()),
+                )
+                .height(CONTROL_HEIGHT)
+                .disabled(blocked.is_some() || nothing_pending);
             if blocked.is_none() && !nothing_pending {
-                b = b.on_press(Message::Machine(Msg::Apply));
+                control = control.on_press(Message::Machine(Msg::Apply));
             }
-            b.into()
+            control
         };
-        let revert: Element<'_, Message> = {
-            let mut b = button(control_label("Revert"))
-                .style(theme::quiet_button(scheme))
-                .height(CONTROL_HEIGHT);
+        let revert: Control<'_, Message> = {
+            let mut control = self
+                .control(
+                    control_label("Revert"),
+                    theme::quiet_surface(*scheme.tokens()),
+                )
+                .height(CONTROL_HEIGHT)
+                .disabled(nothing_pending);
             if !nothing_pending {
-                b = b.on_press(Message::Machine(Msg::Revert));
+                control = control.on_press(Message::Machine(Msg::Revert));
             }
-            b.into()
+            control
         };
-        let notice = machine.notice().map(|notice| match notice {
-            Notice::Done(message) => ui_text(capitalize(message))
-                .size(13)
-                .color(scheme.tokens().success),
-            Notice::Failed(message) => ui_text(capitalize(message))
-                .size(13)
-                .color(scheme.tokens().danger_text),
-        });
-        let changed = moved_lines(machine, scheme);
+        let notice = self.notice_line(scheme, 1.0);
+        let changed = self.changed_line(scheme, 1.0);
         let reason = blocked.map(|reason| {
             ui_text(capitalize(&reason))
                 .size(13)
@@ -1001,22 +1708,86 @@ impl Shell {
         let footer = footer.padding([12, 16]);
         // The cards take the height the pinned footer leaves over; the footer
         // never scrolls out of the shipped window.
-        column![
-            scrollable(container(body).padding([12, 16]))
-                .style(theme::scrollable(scheme))
-                .height(Length::Fill),
-            footer
-        ]
-        .into()
+        column![cards, footer].into()
+    }
+
+    /// The footer's (or the Device card's) notice: the state's, or the ghost of
+    /// the one that just left, at `alpha` of the surface it sits on.
+    fn notice_line(&self, scheme: Scheme, alpha: f32) -> Option<Element<'_, Message>> {
+        let current = self.machine.notice().map(|notice| match notice {
+            Notice::Done(message) => (message.as_str(), true),
+            Notice::Failed(message) => (message.as_str(), false),
+        });
+        let (text, success, fade) = ghost_notice(&self.motion.notice, current, self.motion.now())?;
+        let colour = if success {
+            scheme.tokens().success
+        } else {
+            scheme.tokens().danger_text
+        };
+        Some(
+            ui_text(capitalize(text))
+                .size(13)
+                .color(colour.scale_alpha(fade * alpha))
+                .into(),
+        )
+    }
+
+    /// The moved lines, or the ghost of the ones that just left.
+    fn changed_line(&self, scheme: Scheme, alpha: f32) -> Option<Element<'_, Message>> {
+        let current = {
+            let lines = self.machine.changed();
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        };
+        let (text, fade) = ghost_line(&self.motion.changed, current.as_deref(), self.motion.now())?;
+        Some(
+            ui_text(capitalize(text))
+                .size(13)
+                .color(scheme.tokens().warning.scale_alpha(fade * alpha))
+                .into(),
+        )
+    }
+
+    /// One control in the base layer. Its hover fade and press sink live in the
+    /// control widget's own state, read from the cursor on every event, so a
+    /// control that vanishes, turns disabled or sits under the prompt's scrim
+    /// keeps no stale surface. While a prompt is open the base draws at rest.
+    fn control<'a>(
+        &self,
+        content: impl Into<Element<'a, Message>>,
+        surface: theme::Surface<'a>,
+    ) -> Control<'a, Message> {
+        Control::new(content, surface, self.motion.prefs).frozen(self.machine.prompt().is_some())
+    }
+
+    /// A control inside the prompt itself: it draws above the scrim and keeps
+    /// its pointer state.
+    fn modal_control<'a>(
+        &self,
+        content: impl Into<Element<'a, Message>>,
+        surface: theme::Surface<'a>,
+    ) -> Control<'a, Message> {
+        Control::new(content, surface, self.motion.prefs)
+    }
+
+    /// Whether the base layer may translate at all: an open prompt's scrim
+    /// covers it, and a translated `Float` would paint above that scrim.
+    fn base_moves(&self) -> bool {
+        self.machine.prompt().is_none()
     }
 
     // --- Performance ----------------------------------------------------------
 
-    fn performance_pane(&self, scheme: Scheme) -> Element<'_, Message> {
+    fn performance_pane(&self, look: Look) -> Element<'_, Message> {
         let machine = &self.machine;
-        let t = scheme.tokens();
+        let t = look.tokens();
         let stage_texts = machine.stage_texts().unwrap_or_default();
         let stage_colors = machine.stage_colors();
+        // An unreadable memory means the colour is unknown outright; a readable
+        // memory that never remembered one says which value is missing.
+        let memory_broken = machine
+            .snapshot()
+            .and_then(|snap| snap.memory_error.as_ref())
+            .is_some();
 
         let stage_rows: Vec<Element<'_, Message>> = stage_texts
             .iter()
@@ -1034,22 +1805,22 @@ impl Shell {
                 };
                 let mut control_children: Vec<Element<'_, Message>> = vec![
                     text_input("100-19000", value)
-                        .style(theme::text_input(scheme))
+                        .style(theme::text_input_at(t))
                         .font(MONO_FONT)
                         .size(14)
                         .padding([9.0, 12.0])
                         .on_input(move |text| {
                             Message::Machine(Msg::Edit(Edit::DpiText(index, text)))
                         })
-                        .width(110)
+                        .width(VALUE_CONTROL_WIDTH)
                         .into(),
                 ];
                 if let Some(color) = remembered {
-                    control_children.push(color_swatch(scheme, color));
+                    control_children.push(color_swatch(look, color));
                 }
                 control_children.push(
                     text_input("hex", &hex_value)
-                        .style(theme::text_input(scheme))
+                        .style(theme::text_input_at(t))
                         .font(if hex_value.is_empty() {
                             UI_FONT
                         } else {
@@ -1060,94 +1831,134 @@ impl Shell {
                         .on_input(move |text| {
                             Message::Machine(Msg::Edit(Edit::StageColorHex(index, text)))
                         })
-                        .width(80)
+                        .width(HEX_WIDTH)
                         .into(),
                 );
                 if stage_texts.len() > 1 {
-                    control_children.push(
-                        button(control_label("Remove"))
-                            .on_press(Message::Machine(Msg::Edit(Edit::RemoveStage(index))))
-                            .style(theme::quiet_button(scheme))
-                            .height(CONTROL_HEIGHT)
-                            .into(),
-                    );
+                    let remove = self
+                        .control(control_label("Remove"), theme::quiet_surface(t))
+                        .height(CONTROL_HEIGHT)
+                        .on_press(Message::Machine(Msg::Edit(Edit::RemoveStage(index))));
+                    control_children.push(remove.into());
                 }
                 let control = row(control_children)
                     .spacing(8)
                     .align_y(iced::Alignment::Center);
-                let mut stage_tags = Vec::new();
-                if remembered.is_none() {
-                    stage_tags.push("Unknown");
-                }
+                let tags = match (remembered.is_none(), memory_broken) {
+                    (true, true) => vec!["Unknown"],
+                    (true, false) => vec!["Colour unknown"],
+                    (false, _) => Vec::new(),
+                };
                 setting_row(
-                    scheme,
+                    look,
                     format!("Stage {}", index + 1),
                     control.into(),
                     Element::from(space()),
-                    stage_tags,
+                    tags,
                 )
             })
             .collect();
 
-        let add_stage = if stage_texts.len() < gctl_proto::DpiStages::MAX {
-            Some(
-                button(control_label("Add stage"))
-                    .style(theme::primary_button(scheme))
+        let add_stage: Option<Element<'_, Message>> =
+            if stage_texts.len() < gctl_proto::DpiStages::MAX {
+                let add = self
+                    .control(control_label("Add stage"), theme::secondary_surface(t))
                     .height(CONTROL_HEIGHT)
-                    .on_press(Message::Machine(Msg::Edit(Edit::AddStage))),
-            )
-        } else {
-            None
-        };
+                    .on_press(Message::Machine(Msg::Edit(Edit::AddStage)));
+                Some(add.into())
+            } else {
+                None
+            };
 
-        let active_stage: Element<'_, Message> = pick_list(
-            (1..=stage_texts.len() as u8).collect::<Vec<_>>(),
-            machine.active_stage(),
-            |stage| Message::Machine(Msg::Edit(Edit::ActiveStage(stage))),
-        )
-        .placeholder("active stage")
-        .style(theme::pick_list(scheme))
-        .menu_style(theme::pick_menu(scheme))
-        .text_size(14)
-        .font(MONO_FONT)
-        .padding([9.0, 12.0])
-        .into();
+        let stage_count = stage_texts.len();
+        let active_options: Vec<String> = (1..=stage_count)
+            .filter_map(|stage| u8::try_from(stage).ok())
+            .filter_map(|stage| parse::dpi_stage_number(stage).ok())
+            .map(parse::format_dpi_stage)
+            .collect();
+        let active_selected = machine
+            .active_stage()
+            .map(|stage| usize::from(stage).saturating_sub(1));
+        let active_labels = active_options.clone();
+        let active_stage = dropdown(
+            look,
+            self.motion.prefs,
+            self.machine.prompt().is_some(),
+            Field {
+                id: "active-stage-picker".to_owned(),
+                width: VALUE_CONTROL_WIDTH,
+                placeholder: "Select",
+                font: MONO_FONT,
+            },
+            active_options,
+            active_selected,
+            move |index| {
+                active_labels
+                    .get(index)
+                    .and_then(|label| parse::dpi_stage(label).ok())
+                    .map(|stage| {
+                        Message::Machine(Msg::Edit(Edit::ActiveStage(parse::dpi_stage_value(
+                            stage,
+                        ))))
+                    })
+            },
+        );
 
-        let polling: Element<'_, Message> = container(
-            pick_list(
-                POLLING_OPTIONS.as_slice(),
-                machine.polling_rate().map(polling_label),
-                |label| Message::Machine(Msg::Edit(polling_pick(&label))),
-            )
-            .style(theme::pick_list(scheme))
-            .menu_style(theme::pick_menu(scheme))
-            .text_size(14)
-            .font(MONO_FONT)
-            .padding([9.0, 12.0]),
-        )
-        .id("polling-picker")
-        .into();
+        let polling_options = POLLING_OPTIONS.clone();
+        let polling_selected = machine.polling_rate().and_then(|rate| {
+            let label = polling_label(rate);
+            polling_options.iter().position(|option| *option == label)
+        });
+        let polling_labels = polling_options.clone();
+        let polling = dropdown(
+            look,
+            self.motion.prefs,
+            self.machine.prompt().is_some(),
+            Field {
+                id: "polling-picker".to_owned(),
+                width: VALUE_CONTROL_WIDTH,
+                placeholder: "Select",
+                font: MONO_FONT,
+            },
+            polling_options,
+            polling_selected,
+            move |index| {
+                polling_labels
+                    .get(index)
+                    .map(|label| Message::Machine(Msg::Edit(polling_pick(label))))
+            },
+        );
 
-        let lift_off: Element<'_, Message> = container(
-            pick_list(
-                LIFT_OFF_OPTIONS.as_slice(),
-                machine.lift_off().map(lift_off_label),
-                |label| Message::Machine(Msg::Edit(lift_off_pick(&label))),
-            )
-            .style(theme::pick_list(scheme))
-            .menu_style(theme::pick_menu(scheme))
-            .text_size(14)
-            .font(MONO_FONT)
-            .padding([9.0, 12.0]),
-        )
-        .id("lift-off-picker")
-        .into();
+        let lift_off_options = LIFT_OFF_OPTIONS.clone();
+        let lift_off_selected = machine.lift_off().and_then(|lift_off| {
+            let label = lift_off_label(lift_off);
+            lift_off_options.iter().position(|option| *option == label)
+        });
+        let lift_off_labels = lift_off_options.clone();
+        let lift_off = dropdown(
+            look,
+            self.motion.prefs,
+            self.machine.prompt().is_some(),
+            Field {
+                id: "lift-off-picker".to_owned(),
+                width: VALUE_CONTROL_WIDTH,
+                placeholder: "Select",
+                font: MONO_FONT,
+            },
+            lift_off_options,
+            lift_off_selected,
+            move |index| {
+                lift_off_labels
+                    .get(index)
+                    .map(|label| Message::Machine(Msg::Edit(lift_off_pick(label))))
+            },
+        );
 
         let debounce = machine.debounce().unwrap_or(0);
         let debounce_control: Element<'_, Message> = slider(0..=16, debounce, |ms| {
             Message::Machine(Msg::Edit(Edit::Debounce(ms)))
         })
-        .style(theme::slider(scheme))
+        .style(theme::slider_at(t))
         .width(Length::Fill)
         .height(CONTROL_HEIGHT)
         .into();
@@ -1156,7 +1967,7 @@ impl Shell {
 
         let never = machine.sleep_never().unwrap_or(false);
         let minutes = text_input("minutes", &machine.sleep_minutes().unwrap_or_default())
-            .style(theme::text_input(scheme))
+            .style(theme::text_input_at(t))
             .font(MONO_FONT)
             .size(14)
             .padding([9.0, 12.0])
@@ -1170,7 +1981,7 @@ impl Shell {
                 .into()
         };
         let seconds = text_input("seconds", &machine.sleep_seconds().unwrap_or_default())
-            .style(theme::text_input(scheme))
+            .style(theme::text_input_at(t))
             .font(MONO_FONT)
             .size(14)
             .padding([9.0, 12.0])
@@ -1185,9 +1996,9 @@ impl Shell {
         };
         let sleep_row: Element<'_, Message> = row![
             checkbox(never)
-                .style(theme::checkbox(scheme))
+                .style(theme::checkbox_at(t))
                 .on_toggle(|never| Message::Machine(Msg::Edit(Edit::SleepNever(never)))),
-            ui_text("Never").size(14),
+            ui_text("Never").size(14).color(t.text),
             minutes,
             ui_text("m").size(13).color(t.text_3),
             seconds,
@@ -1206,62 +2017,53 @@ impl Shell {
             dpi_tags.push("last set by gctl");
         }
 
-        let mut dpi_body = column![
-            setting_row(
-                scheme,
-                "DPI stages",
-                Element::from(space()),
-                Element::from(space()),
-                dpi_tags
-            ),
-            column(stage_rows).spacing(6),
-        ]
-        .spacing(10);
+        let mut dpi_body = column![column(stage_rows).spacing(6)].spacing(10);
         if let Some(add) = add_stage {
             dpi_body = dpi_body.push(setting_row(
-                scheme,
+                look,
                 "",
-                add.into(),
+                add,
                 Element::from(space()),
                 Vec::new(),
             ));
         }
         dpi_body = dpi_body.push(setting_row(
-            scheme,
+            look,
             "Active stage",
             active_stage,
             Element::from(space()),
             vec!["per profile"],
         ));
-        let dpi_card = card(scheme, "DPI", dpi_body);
+        let dpi_card = card(look, "DPI", dpi_tags, dpi_body);
 
         let sensor_card = card(
-            scheme,
+            look,
             "Sensor",
+            Vec::new(),
             column![
                 setting_row(
-                    scheme,
+                    look,
                     "Polling rate",
                     polling,
                     Element::from(space()),
                     vec!["all profiles"]
                 ),
                 setting_row(
-                    scheme,
+                    look,
                     "Lift-off",
                     lift_off,
                     Element::from(space()),
                     vec!["all profiles"]
                 ),
                 setting_row(
-                    scheme,
+                    look,
                     "Debounce",
                     debounce_control,
                     debounce_readout,
                     vec!["per profile"]
                 ),
                 setting_row(
-                    scheme,
+                    look,
                     "Sleep",
                     sleep_row,
                     Element::from(space()),
@@ -1276,20 +2078,41 @@ impl Shell {
 
     // --- Lighting -------------------------------------------------------------
 
-    fn lighting_pane(&self, scheme: Scheme) -> Element<'_, Message> {
+    fn lighting_pane(&self, look: Look) -> Element<'_, Message> {
         let machine = &self.machine;
+        let t = look.tokens();
         let kind = machine.effect_kind();
 
-        let effect_picker = pick_list(EffectKind::ALL, kind, |kind| {
-            Message::Machine(Msg::Edit(Edit::Effect(kind)))
-        })
-        .style(theme::pick_list(scheme))
-        .menu_style(theme::pick_menu(scheme))
-        .text_size(14)
-        .padding([9.0, 12.0]);
-        // An unknown effect reads `Unknown` as a tag in the tag column, so a
-        // selector can count it, never as an uncountable picker placeholder.
-        let effect_row: Element<'_, Message> = effect_picker.into();
+        let effect_options: Vec<String> = parse::EFFECT_NAMES
+            .iter()
+            .map(|token| parse::effect_label(token))
+            .collect();
+        let effect_selected = kind.and_then(|kind| {
+            parse::EFFECT_NAMES
+                .iter()
+                .position(|token| *token == kind.token())
+        });
+        let effect_picker = dropdown(
+            look,
+            self.motion.prefs,
+            self.machine.prompt().is_some(),
+            Field {
+                id: "effect-picker".to_owned(),
+                width: VALUE_CONTROL_WIDTH,
+                placeholder: "Select",
+                font: UI_FONT,
+            },
+            effect_options,
+            effect_selected,
+            |index| {
+                parse::EFFECT_NAMES
+                    .get(index)
+                    .copied()
+                    .and_then(EffectKind::from_token)
+                    .map(|kind| Message::Machine(Msg::Edit(Edit::Effect(kind))))
+            },
+        );
+        let effect_row: Element<'_, Message> = effect_picker;
 
         let takes_rate = matches!(
             kind,
@@ -1303,10 +2126,7 @@ impl Shell {
                     | EffectKind::Wave
             )
         );
-        let takes_colors = matches!(
-            kind,
-            Some(EffectKind::Pulse | EffectKind::Rave | EffectKind::Solid | EffectKind::PulseOne)
-        );
+        let takes_colors = takes_colours(kind);
 
         let rate_row: Option<(Element<'_, Message>, Element<'_, Message>)> = if takes_rate {
             let rate = machine.effect_rate().unwrap_or(0);
@@ -1314,7 +2134,7 @@ impl Shell {
                 slider(0..=100, rate, |rate| {
                     Message::Machine(Msg::Edit(Edit::Rate(rate)))
                 })
-                .style(theme::slider(scheme))
+                .style(theme::slider_at(t))
                 .width(Length::Fill)
                 .height(CONTROL_HEIGHT)
                 .into(),
@@ -1326,20 +2146,7 @@ impl Shell {
 
         let color_rows: Vec<Element<'_, Message>> = if takes_colors {
             let colors = machine.effect_colors().unwrap_or_default();
-            let max = match kind {
-                Some(EffectKind::Pulse) => 6usize,
-                Some(EffectKind::Rave) => 2usize,
-                Some(
-                    EffectKind::Off
-                    | EffectKind::Glorious
-                    | EffectKind::Cycle
-                    | EffectKind::Solid
-                    | EffectKind::PulseOne
-                    | EffectKind::Tail
-                    | EffectKind::Wave,
-                )
-                | None => 1usize,
-            };
+            let max = max_effect_colors(kind);
             let mut rows: Vec<Element<'_, Message>> = (0..colors.len())
                 .map(|index| {
                     let remembered = colors[index];
@@ -1349,22 +2156,21 @@ impl Shell {
                     } else {
                         hex
                     };
-                    let remove = if colors.len() > min_effect_colors(kind) {
-                        Some(
-                            button(control_label("Remove"))
-                                .on_press(Message::Machine(Msg::Edit(Edit::RemoveEffectColor(
-                                    index,
-                                ))))
-                                .style(theme::quiet_button(scheme))
-                                .height(CONTROL_HEIGHT),
-                        )
+                    let remove: Option<Element<'_, Message>> = if colors.len()
+                        > min_effect_colors(kind)
+                    {
+                        let remove = self
+                            .control(control_label("Remove"), theme::quiet_surface(t))
+                            .height(CONTROL_HEIGHT)
+                            .on_press(Message::Machine(Msg::Edit(Edit::RemoveEffectColor(index))));
+                        Some(remove.into())
                     } else {
                         None
                     };
                     let mut control = row![
-                        color_swatch(scheme, remembered),
+                        color_swatch(look, remembered),
                         text_input("hex", &hex_value)
-                            .style(theme::text_input(scheme))
+                            .style(theme::text_input_at(t))
                             .font(if hex_value.is_empty() {
                                 UI_FONT
                             } else {
@@ -1375,7 +2181,7 @@ impl Shell {
                             .on_input(move |text| {
                                 Message::Machine(Msg::Edit(Edit::EffectColorHex(index, text)))
                             })
-                            .width(80),
+                            .width(HEX_WIDTH),
                     ]
                     .spacing(8)
                     .align_y(iced::Alignment::Center);
@@ -1386,13 +2192,11 @@ impl Shell {
                 })
                 .collect();
             if colors.len() < max {
-                rows.push(
-                    button(control_label("Add colour"))
-                        .style(theme::primary_button(scheme))
-                        .height(CONTROL_HEIGHT)
-                        .on_press(Message::Machine(Msg::Edit(Edit::AddEffectColor)))
-                        .into(),
-                );
+                let add = self
+                    .control(control_label("Add colour"), theme::secondary_surface(t))
+                    .height(CONTROL_HEIGHT)
+                    .on_press(Message::Machine(Msg::Edit(Edit::AddEffectColor)));
+                rows.push(add.into());
             }
             rows
         } else {
@@ -1400,14 +2204,14 @@ impl Shell {
         };
 
         let (wired_control, wired_readout, wired_unknown) = brightness_row(
-            scheme,
+            look,
             "wired-slider",
             machine.brightness_wired(),
             |value| Message::Machine(Msg::Edit(Edit::BrightnessWired(value))),
             Edit::BrightnessWiredRelease,
         );
         let (wireless_control, wireless_readout, wireless_unknown) = brightness_row(
-            scheme,
+            look,
             "wireless-slider",
             machine.brightness_wireless(),
             |value| Message::Machine(Msg::Edit(Edit::BrightnessWireless(value))),
@@ -1438,7 +2242,7 @@ impl Shell {
         }
 
         let mut effect_body = column![setting_row(
-            scheme,
+            look,
             "Effect",
             effect_row,
             Element::from(space()),
@@ -1447,7 +2251,7 @@ impl Shell {
         .spacing(10);
         if let Some((rate_control, rate_readout)) = rate_row {
             effect_body = effect_body.push(setting_row(
-                scheme,
+                look,
                 "Speed",
                 rate_control,
                 rate_readout,
@@ -1456,22 +2260,23 @@ impl Shell {
         }
         if takes_colors {
             effect_body = effect_body.push(setting_row(
-                scheme,
+                look,
                 "Colours",
                 column(color_rows).spacing(6).into(),
                 Element::from(space()),
                 Vec::new(),
             ));
         }
-        let effect_card = card(scheme, "Effect", effect_body);
+        let effect_card = card(look, "Effect", Vec::new(), effect_body);
 
         let brightness_card = card(
-            scheme,
+            look,
             "Brightness",
+            Vec::new(),
             column![
-                setting_row(scheme, "Wired", wired_control, wired_readout, wired_tags),
+                setting_row(look, "Wired", wired_control, wired_readout, wired_tags),
                 setting_row(
-                    scheme,
+                    look,
                     "Wireless",
                     wireless_control,
                     wireless_readout,
@@ -1486,11 +2291,12 @@ impl Shell {
 
     // --- Buttons --------------------------------------------------------------
 
-    fn buttons_pane(&self, scheme: Scheme) -> Element<'_, Message> {
+    fn buttons_pane(&self, look: Look) -> Element<'_, Message> {
         let machine = &self.machine;
+        let t = look.tokens();
         let rows: Vec<Element<'_, Message>> = crate::get::BUTTONS
             .iter()
-            .map(|button| self.bind_row(scheme, *button))
+            .map(|button| self.bind_row(look, *button))
             .collect();
 
         let scroll = machine.scroll();
@@ -1506,18 +2312,18 @@ impl Shell {
         }
         let invert = scroll == Some(gctl_proto::ScrollDirection::Invert);
         let toggler = toggler(invert)
-            .style(theme::toggler(scheme))
+            .style(theme::toggler_at(t))
             .on_toggle(|invert| Message::Machine(Msg::Edit(Edit::Scroll(scroll_of(invert)))));
         // Unknown draws dimmed, like the unknown brightness sliders, so an OFF
         // toggler never reads as `default`.
         let toggler: Element<'_, Message> = if scroll.is_none() {
-            toggler.style(theme::dim_toggler(scheme)).into()
+            toggler.style(theme::dim_toggler_at(t)).into()
         } else {
             toggler.into()
         };
 
         let scroll_row: Element<'_, Message> = container(
-            row![toggler, ui_text("Invert scroll").size(14)]
+            row![toggler, ui_text("Invert scroll").size(14).color(t.text)]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
         )
@@ -1525,47 +2331,61 @@ impl Shell {
         .into();
 
         let scroll_card = card(
-            scheme,
+            look,
             "Scroll",
+            Vec::new(),
             setting_row(
-                scheme,
+                look,
                 "Scroll",
                 scroll_row,
                 Element::from(space()),
                 scroll_tags,
             ),
         );
-        let buttons_card = card(scheme, "Buttons", column(rows).spacing(8));
+        let buttons_card = card(look, "Buttons", Vec::new(), column(rows).spacing(8));
 
         column![scroll_card, buttons_card].spacing(16).into()
     }
 
-    fn bind_row(&self, scheme: Scheme, button: Button) -> Element<'_, Message> {
+    fn bind_row(&self, look: Look, button: Button) -> Element<'_, Message> {
         let machine = &self.machine;
-        let t = scheme.tokens();
+        let t = look.tokens();
         let binding = machine.bind(button);
         let label = button_label(button);
         let remembered_bind = machine.snapshot().and_then(|snap| snap.bind(button));
         let category = binding_category(binding);
 
-        let category_picker = pick_list(
-            parse::BIND_FAMILY_TOKENS,
-            category.map(parse::family_token),
-            move |label| {
-                let edit = match parse::bind_category(label) {
-                    Some(category) => default_binding(button, category),
-                    None => Edit::InvalidBind(button),
-                };
-                Message::Machine(Msg::Edit(edit))
+        let category_options: Vec<String> = parse::BIND_FAMILY_TOKENS
+            .iter()
+            .map(|token| (*token).to_owned())
+            .collect();
+        let category_selected = category.and_then(|category| {
+            let token = parse::family_token(category);
+            category_options.iter().position(|option| option == token)
+        });
+        let category_picker = dropdown(
+            look,
+            self.motion.prefs,
+            self.machine.prompt().is_some(),
+            Field {
+                id: format!("bind-category-picker-{}", parse::format_button(button)),
+                width: KEY_PICKER_WIDTH,
+                placeholder: "Select",
+                font: UI_FONT,
             },
-        )
-        .style(theme::pick_list(scheme))
-        .menu_style(theme::pick_menu(scheme))
-        .text_size(14)
-        .padding([9.0, 12.0]);
+            category_options,
+            category_selected,
+            move |index| {
+                parse::BIND_FAMILY_TOKENS
+                    .get(index)
+                    .copied()
+                    .and_then(parse::bind_category)
+                    .map(|category| Message::Machine(Msg::Edit(default_binding(button, category))))
+            },
+        );
         // An unknown bind reads `Unknown` as a tag in the tag column, so a
         // selector can count it, never as an uncountable picker placeholder.
-        let category_cell: Element<'_, Message> = category_picker.into();
+        let category_cell: Element<'_, Message> = category_picker;
 
         let control: Element<'_, Message> = match category {
             None | Some(parse::BindCategory::None) => row![category_cell]
@@ -1574,12 +2394,12 @@ impl Shell {
                 .into(),
             Some(parse::BindCategory::Mouse) => row![
                 category_cell,
-                fn_picker(
-                    scheme,
+                self.fn_picker(
+                    look,
                     &parse::MOUSE_FN_NAMES,
                     parse::BindCategory::Mouse,
                     binding,
-                    button,
+                    button
                 ),
             ]
             .spacing(8)
@@ -1587,12 +2407,12 @@ impl Shell {
             .into(),
             Some(parse::BindCategory::Media) => row![
                 category_cell,
-                fn_picker(
-                    scheme,
+                self.fn_picker(
+                    look,
                     &parse::MEDIA_FN_NAMES,
                     parse::BindCategory::Media,
                     binding,
-                    button,
+                    button
                 ),
             ]
             .spacing(8)
@@ -1600,12 +2420,12 @@ impl Shell {
             .into(),
             Some(parse::BindCategory::Dpi) => row![
                 category_cell,
-                fn_picker(
-                    scheme,
+                self.fn_picker(
+                    look,
                     &parse::DPI_FN_NAMES,
                     parse::BindCategory::Dpi,
                     binding,
-                    button,
+                    button
                 ),
             ]
             .spacing(8)
@@ -1613,12 +2433,12 @@ impl Shell {
             .into(),
             Some(parse::BindCategory::Keyboard) => row![
                 category_cell,
-                fn_picker(
-                    scheme,
+                self.fn_picker(
+                    look,
                     &parse::KEYBOARD_FN_NAMES,
                     parse::BindCategory::Keyboard,
                     binding,
-                    button,
+                    button
                 ),
             ]
             .spacing(8)
@@ -1629,7 +2449,7 @@ impl Shell {
                 // is always a key here; render the category cell alone if not.
                 let Some(Binding::Key { key, modifiers }) = binding else {
                     return setting_row(
-                        scheme,
+                        look,
                         label,
                         row![category_cell]
                             .spacing(8)
@@ -1639,8 +2459,27 @@ impl Shell {
                         Vec::new(),
                     );
                 };
-                let key_names = key_names();
-                let current_key = Some(key.name());
+                let key_options = key_names();
+                let current_key = key.name();
+                let key_selected = key_options.iter().position(|name| *name == current_key);
+                let key_picker = dropdown(
+                    look,
+                    self.motion.prefs,
+                    self.machine.prompt().is_some(),
+                    Field {
+                        id: format!("key-picker-{}", parse::format_button(button)),
+                        width: KEY_PICKER_WIDTH,
+                        placeholder: "Select",
+                        font: UI_FONT,
+                    },
+                    key_options,
+                    key_selected,
+                    move |index| {
+                        gctl_proto::Key::all().nth(index).map(|key| {
+                            Message::Machine(Msg::Edit(key_edit(button, key, modifiers)))
+                        })
+                    },
+                );
                 // The modifiers sit on a second line under the pickers, so the
                 // widest (`meta-right`) never wraps and the key picker keeps its
                 // full width.
@@ -1651,7 +2490,7 @@ impl Shell {
                         let on = modifiers.bits() & bit.bits() != 0;
                         row![
                             checkbox(on)
-                                .style(theme::checkbox(scheme))
+                                .style(theme::checkbox_at(t))
                                 .on_toggle(move |on| {
                                     let mut rebuilt = gctl_proto::Modifiers::NONE;
                                     for (b, n) in parse::MODIFIERS {
@@ -1673,18 +2512,6 @@ impl Shell {
                         .into()
                     })
                     .collect();
-                let key_picker = pick_list(key_names, current_key, move |name| {
-                    let edit = match gctl_proto::Key::from_name(name) {
-                        Ok(key) => key_edit(button, key, modifiers),
-                        Err(_) => Edit::InvalidBind(button),
-                    };
-                    Message::Machine(Msg::Edit(edit))
-                })
-                .style(theme::pick_list(scheme))
-                .menu_style(theme::pick_menu(scheme))
-                .text_size(14)
-                .padding([9.0, 12.0])
-                .width(KEY_PICKER_WIDTH);
                 column![
                     row![category_cell, key_picker]
                         .spacing(8)
@@ -1704,14 +2531,52 @@ impl Shell {
         if category.is_none() {
             tags.push("Unknown");
         }
-        setting_row(scheme, label, control, Element::from(space()), tags)
+        setting_row(look, label, control, Element::from(space()), tags)
+    }
+
+    /// A bind's function picker, built through the parse formatter so the
+    /// picker cannot drift from the CLI's grammar.
+    fn fn_picker(
+        &self,
+        look: Look,
+        names: &'static [&'static str],
+        family: parse::BindCategory,
+        binding: Option<Binding>,
+        button: Button,
+    ) -> Element<'_, Message> {
+        let family_token = parse::family_token(family);
+        let options: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+        let current = binding.and_then(|binding| {
+            let text = parse::format_binding(binding);
+            let name = text.strip_prefix(family_token)?.strip_prefix(':')?;
+            Some(name.to_owned())
+        });
+        let selected = current.and_then(|name| options.iter().position(|option| *option == name));
+        dropdown(
+            look,
+            self.motion.prefs,
+            self.machine.prompt().is_some(),
+            Field {
+                id: format!("bind-fn-picker-{}", parse::format_button(button)),
+                width: KEY_PICKER_WIDTH,
+                placeholder: "Select",
+                font: UI_FONT,
+            },
+            options,
+            selected,
+            move |index| {
+                let name = names.get(index)?;
+                let edit = bind_edit(button, &format!("{family_token}:{name}"));
+                Some(Message::Machine(Msg::Edit(edit)))
+            },
+        )
     }
 
     // --- Device ---------------------------------------------------------------
 
-    fn device_pane(&self, scheme: Scheme) -> Element<'_, Message> {
+    fn device_pane(&self, look: Look) -> Element<'_, Message> {
         let machine = &self.machine;
-        let t = scheme.tokens();
+        let t = look.tokens();
         let Some(snap) = machine.live_snapshot() else {
             return center(ui_text("Loading")).into();
         };
@@ -1721,9 +2586,14 @@ impl Shell {
         };
         let firmware = snap.firmware.to_string();
         let battery_control: Element<'_, Message> = match snap.battery.percent {
-            Some(percent) => container(ui_text(format!("{percent}%")).size(14).font(MONO_FONT))
-                .center_y(CONTROL_HEIGHT)
-                .into(),
+            Some(percent) => container(
+                ui_text(format!("{percent}%"))
+                    .size(14)
+                    .font(MONO_FONT)
+                    .color(t.text),
+            )
+            .center_y(CONTROL_HEIGHT)
+            .into(),
             None => Element::from(space()),
         };
         let battery_tags = if snap.battery.percent.is_none() {
@@ -1735,28 +2605,36 @@ impl Shell {
         let profile = snap.profile.get();
         let blocked = machine.file_blocked();
         let export_button: Element<'_, Message> = {
-            let mut b = button(file_button_label(format!("Export profile {profile}")))
-                .style(theme::primary_button(scheme))
+            let mut control = self
+                .control(
+                    file_button_label(format!("Export profile {profile}")),
+                    theme::secondary_surface(t),
+                )
                 .width(FILE_BUTTON_WIDTH)
-                .height(CONTROL_HEIGHT);
+                .height(CONTROL_HEIGHT)
+                .disabled(blocked.is_some());
             if blocked.is_none() {
-                b = b.on_press(Message::ExportClicked);
+                control = control.on_press(Message::ExportClicked);
             }
-            b.into()
+            control.into()
         };
         let import_button: Element<'_, Message> = {
-            let mut b = button(file_button_label(format!("Import into profile {profile}")))
-                .style(theme::primary_button(scheme))
+            let mut control = self
+                .control(
+                    file_button_label(format!("Import into profile {profile}")),
+                    theme::secondary_surface(t),
+                )
                 .width(FILE_BUTTON_WIDTH)
-                .height(CONTROL_HEIGHT);
+                .height(CONTROL_HEIGHT)
+                .disabled(blocked.is_some());
             if blocked.is_none() {
-                b = b.on_press(Message::ImportClicked);
+                control = control.on_press(Message::ImportClicked);
             }
-            b.into()
+            control.into()
         };
         let export_row: Element<'_, Message> = row![
             text_input("path.toml", &self.export_path)
-                .style(theme::text_input(scheme))
+                .style(theme::text_input_at(t))
                 .size(14)
                 .padding([9.0, 12.0])
                 .on_input(Message::ExportPath)
@@ -1768,7 +2646,7 @@ impl Shell {
         .into();
         let import_row: Element<'_, Message> = row![
             text_input("path.toml", &self.import_path)
-                .style(theme::text_input(scheme))
+                .style(theme::text_input_at(t))
                 .size(14)
                 .padding([9.0, 12.0])
                 .on_input(Message::ImportPath)
@@ -1779,46 +2657,44 @@ impl Shell {
         .align_y(iced::Alignment::Center)
         .into();
 
-        let notice = machine.notice().map(|notice| match notice {
-            Notice::Done(message) => ui_text(capitalize(message)).size(13).color(t.success),
-            Notice::Failed(message) => ui_text(capitalize(message)).size(13).color(t.danger_text),
-        });
-        let changed = moved_lines(machine, scheme);
+        let notice = self.notice_line(look.scheme, look.alpha);
+        let changed = self.changed_line(look.scheme, look.alpha);
         let reason = blocked.map(|reason| ui_text(capitalize(&reason)).size(13).color(t.text_3));
 
         let mouse_card = card(
-            scheme,
+            look,
             "Mouse",
+            Vec::new(),
             column![
                 setting_row(
-                    scheme,
+                    look,
                     "Model",
-                    container(ui_text(snap.model.name).size(14))
+                    container(ui_text(snap.model.name).size(14).color(t.text))
                         .center_y(CONTROL_HEIGHT)
                         .into(),
                     Element::from(space()),
                     Vec::new()
                 ),
                 setting_row(
-                    scheme,
+                    look,
                     "Link",
-                    container(ui_text(link).size(14))
+                    container(ui_text(link).size(14).color(t.text))
                         .center_y(CONTROL_HEIGHT)
                         .into(),
                     Element::from(space()),
                     Vec::new()
                 ),
                 setting_row(
-                    scheme,
+                    look,
                     "Firmware",
-                    container(ui_text(firmware).size(14).font(MONO_FONT))
+                    container(ui_text(firmware).size(14).font(MONO_FONT).color(t.text))
                         .center_y(CONTROL_HEIGHT)
                         .into(),
                     Element::from(space()),
                     Vec::new()
                 ),
                 setting_row(
-                    scheme,
+                    look,
                     "Battery",
                     battery_control,
                     Element::from(space()),
@@ -1830,14 +2706,14 @@ impl Shell {
 
         let mut profile_body = column![
             setting_row(
-                scheme,
+                look,
                 "Export profile",
                 export_row,
                 Element::from(space()),
                 Vec::new()
             ),
             setting_row(
-                scheme,
+                look,
                 "Import profile",
                 import_row,
                 Element::from(space()),
@@ -1857,8 +2733,9 @@ impl Shell {
             profile_body = profile_body.push(changed);
         }
         let profile_card = card(
-            scheme,
+            look,
             "Profile file",
+            Vec::new(),
             profile_body.push(
                 ui_text(
                     "Last set by gctl: the mouse cannot report this value, so gctl shows the last one it wrote. Another program or a reset may have changed it since."
@@ -1873,6 +2750,16 @@ impl Shell {
 }
 
 // --- small view helpers --------------------------------------------------------
+
+/// A caps eyebrow as the view draws it: every character upper-cased with one
+/// hair space between them, since iced has no letter-spacing.
+fn eyebrow(word: &str) -> String {
+    word.chars()
+        .flat_map(char::to_uppercase)
+        .map(String::from)
+        .collect::<Vec<_>>()
+        .join("\u{200A}")
+}
 
 /// The one draw-site helper for state-produced copy: it capitalizes the first
 /// letter of every line, so a banner or notice joining two failures never draws
@@ -1893,21 +2780,6 @@ fn capitalize(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// The moved lines, one warning-tone widget in their own slot under the
-/// notice: the footer's, and the Device pane's profile card. `None` when the
-/// last read moved nothing under a live entry.
-fn moved_lines(machine: &State, scheme: Scheme) -> Option<iced::widget::Text<'static>> {
-    let lines = machine.changed();
-    if lines.is_empty() {
-        return None;
-    }
-    Some(
-        ui_text(capitalize(&lines.join("\n")))
-            .size(13)
-            .color(scheme.tokens().warning),
-    )
 }
 
 /// Body text in the UI font.
@@ -1949,21 +2821,22 @@ fn empty_state(scheme: Scheme, heading: &'static str, hint: String) -> Element<'
         .into()
 }
 
-/// One setting card: a title over its rows, surface-1 with a 1px line.
+/// One setting card: an eyebrow title over its rows, surface-1 with a 1px line.
 fn card<'a>(
-    scheme: Scheme,
+    look: Look,
     title: &'static str,
+    tags: Vec<&'static str>,
     body: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    container(column![ui_text(title).size(18), body.into()].spacing(12))
-        .style(theme::card(scheme))
+    container(column![title_row(look, title, tags), body.into()].spacing(12))
+        .style(theme::card_at(look.tokens()))
         .padding(16)
         .width(Length::Fill)
         .into()
 }
 
-/// The fixed widths of the four setting-grid columns: label, readout and tags
-/// are fixed, the control fills the space between label and readout. The same
+/// The fixed widths of the setting grid's columns: label, readout and tags are
+/// fixed, the control fills the space between label and readout. The same
 /// widths on every pane, so every label starts at one x, every slider ends at
 /// one x and every tag row ends at the card's right edge (gui.md §Window).
 const LABEL_COLUMN: f32 = 110.0;
@@ -1979,25 +2852,20 @@ const KEY_PICKER_WIDTH: f32 = 160.0;
 /// one x.
 const FILE_BUTTON_WIDTH: f32 = 170.0;
 
-/// The one setting-row layout, a grid `label | control | readout | tags`: the
-/// control column fills the space between the fixed label and readout columns,
-/// and the tag column is pinned to the card's right edge. A control narrower
-/// than its column sits at the column's left edge.
-fn setting_row<'a>(
-    scheme: Scheme,
-    label: impl iced::widget::text::IntoFragment<'a>,
-    control: Element<'a, Message>,
-    readout: Element<'a, Message>,
-    tags: Vec<&'static str>,
-) -> Element<'a, Message> {
-    let t = scheme.tokens();
-    let label = container(ui_text(label).size(14).color(t.text_2).width(LABEL_COLUMN))
-        .center_y(CONTROL_HEIGHT);
-    let control = container(control).width(Length::Fill);
-    let readout = container(readout)
-        .width(READOUT_COLUMN)
-        .center_y(CONTROL_HEIGHT);
-    let tags = container(row(tags.into_iter().map(|mark| tag(scheme, mark))).spacing(4))
+/// A card's title row: the caps eyebrow in the label column, its marks pinned
+/// to the card's right edge on the same row.
+fn title_row<'a>(look: Look, title: &'static str, tags: Vec<&'static str>) -> Element<'a, Message> {
+    let t = look.tokens();
+    let label = container(
+        ui_text(eyebrow(title))
+            .size(EYEBROW_SIZE)
+            .color(t.text_3)
+            .width(LABEL_COLUMN),
+    )
+    .center_y(CONTROL_HEIGHT);
+    let control = container(space()).width(Length::Fill);
+    let readout = container(space()).width(READOUT_COLUMN);
+    let tags = container(row(tags.into_iter().map(|mark| tag(look, mark))).spacing(4))
         .width(TAG_COLUMN)
         .align_x(iced::Alignment::End)
         .center_y(CONTROL_HEIGHT);
@@ -2008,10 +2876,98 @@ fn setting_row<'a>(
         .into()
 }
 
+/// The one setting-row layout, a grid `label | control | readout | tags`: the
+/// control column fills the space between the fixed label and readout columns,
+/// and the tag column is pinned to the card's right edge. A control narrower
+/// than its column sits at the column's left edge.
+fn setting_row<'a>(
+    look: Look,
+    label: impl iced::widget::text::IntoFragment<'a>,
+    control: Element<'a, Message>,
+    readout: Element<'a, Message>,
+    tags: Vec<&'static str>,
+) -> Element<'a, Message> {
+    let t = look.tokens();
+    let label = container(ui_text(label).size(14).color(t.text_2).width(LABEL_COLUMN))
+        .center_y(CONTROL_HEIGHT);
+    let control = container(control).width(Length::Fill);
+    let readout = container(readout)
+        .width(READOUT_COLUMN)
+        .center_y(CONTROL_HEIGHT);
+    let tags = container(row(tags.into_iter().map(|mark| tag(look, mark))).spacing(4))
+        .width(TAG_COLUMN)
+        .align_x(iced::Alignment::End)
+        .center_y(CONTROL_HEIGHT);
+    row![label, control, readout, tags]
+        .width(Length::Fill)
+        .spacing(8)
+        .align_y(iced::Alignment::Start)
+        .into()
+}
+
+/// One dropdown field's own shape: the id a test finds it by, the grid width it
+/// shares, and the face its labels use.
+struct Field {
+    id: String,
+    width: f32,
+    placeholder: &'static str,
+    font: iced::Font,
+}
+
+/// gctl's own dropdown, wrapped in an id-bearing container of the width the
+/// Performance grid shares. The trigger shows the selected label or a
+/// placeholder, its hover and press living in the control that paints the
+/// field; the panel is the widget's own overlay. An option is picked by its
+/// index into `options`, so no caller compares a label back to a value.
+fn dropdown<'a>(
+    look: Look,
+    prefs: Prefs,
+    frozen: bool,
+    field: Field,
+    options: Vec<String>,
+    selected: Option<usize>,
+    on_select: impl FnMut(usize) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
+    let t = look.tokens();
+    let label = selected
+        .and_then(|index| options.get(index))
+        .cloned()
+        .unwrap_or_else(|| field.placeholder.to_owned());
+    let colour = if selected.is_some() { t.text } else { t.text_4 };
+    let face = container(ui_text(label).size(14).font(field.font).color(colour))
+        .padding([0.0, 12.0])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(iced::Alignment::Center);
+    let trigger = Control::new(face, theme::field_surface(t), prefs)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(0)
+        .frozen(frozen);
+    container(Dropdown::new(
+        dropdown::Paint {
+            scheme: look.scheme,
+            alpha: look.alpha,
+            frozen,
+        },
+        prefs,
+        trigger,
+        options,
+        selected,
+        field.font,
+        on_select,
+    ))
+    .id(field.id)
+    .width(field.width)
+    .height(CONTROL_HEIGHT)
+    .into()
+}
+
 /// A neutral mark tag: text-3 on a quiet surface tint, pill radius.
-fn tag(scheme: Scheme, mark: &'static str) -> Element<'static, Message> {
-    container(ui_text(mark).size(11))
-        .style(theme::tag(scheme))
+fn tag(look: Look, mark: &'static str) -> Element<'static, Message> {
+    let t = look.tokens();
+    container(ui_text(mark).size(11).color(t.text_3))
+        .style(theme::tag_at(t))
         .padding([2.0, 8.0])
         .into()
 }
@@ -2022,6 +2978,37 @@ fn warning_tag(scheme: Scheme, mark: &'static str) -> Element<'static, Message> 
         .style(theme::tag_warning(scheme))
         .padding([2.0, 8.0])
         .into()
+}
+
+/// The battery's meter: a well track with an accent fill at the reading.
+fn battery_meter(scheme: Scheme, percent: u8) -> Element<'static, Message> {
+    let t = scheme.tokens();
+    let width = 40.0;
+    let fill = width * f32::from(percent.min(100)) / 100.0;
+    let track = container(space())
+        .width(width)
+        .height(6)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(t.well)),
+            border: Border {
+                radius: 999.0.into(),
+                width: 1.0,
+                color: t.line,
+            },
+            ..container::Style::default()
+        });
+    let fill = container(space())
+        .width(fill)
+        .height(6)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(t.accent)),
+            border: Border {
+                radius: 999.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        });
+    stack![track, fill].into()
 }
 
 fn opaque_modal(scheme: Scheme, content: Element<'static, Message>) -> Element<'static, Message> {
@@ -2038,7 +3025,12 @@ fn opaque_modal(scheme: Scheme, content: Element<'static, Message>) -> Element<'
     iced::widget::opaque(overlay)
 }
 
-fn discard_prompt(scheme: Scheme, prompt: Prompt, current: Section) -> Element<'static, Message> {
+fn discard_prompt(
+    scheme: Scheme,
+    shell: &Shell,
+    prompt: Prompt,
+    current: Section,
+) -> Element<'static, Message> {
     let message = match prompt {
         // Name the section being LEFT: it is the one whose edits are lost.
         Prompt::Discard(Leave::Section(_)) => {
@@ -2049,25 +3041,26 @@ fn discard_prompt(scheme: Scheme, prompt: Prompt, current: Section) -> Element<'
         }
         Prompt::Import(_) => String::new(),
     };
-    column![
-        ui_text(message).size(20),
-        row![
-            button(control_label("Keep editing"))
-                .on_press(Message::Machine(Msg::KeepEditing))
-                .style(theme::secondary_button(scheme))
-                .height(CONTROL_HEIGHT),
-            button(control_label("Discard"))
-                .on_press(Message::Machine(Msg::Discard))
-                .style(theme::danger_button(scheme))
-                .height(CONTROL_HEIGHT),
-        ]
-        .spacing(12),
-    ]
-    .spacing(12)
-    .into()
+    let keep = shell
+        .modal_control(
+            control_label("Keep editing"),
+            theme::secondary_surface(*scheme.tokens()),
+        )
+        .height(CONTROL_HEIGHT)
+        .on_press(Message::Machine(Msg::KeepEditing));
+    let discard = shell
+        .modal_control(
+            control_label("Discard"),
+            theme::danger_surface(*scheme.tokens()),
+        )
+        .height(CONTROL_HEIGHT)
+        .on_press(Message::Machine(Msg::Discard));
+    column![ui_text(message).size(20), row![keep, discard].spacing(12),]
+        .spacing(12)
+        .into()
 }
 
-fn import_prompt(scheme: Scheme, prompt: Prompt) -> Element<'static, Message> {
+fn import_prompt(scheme: Scheme, shell: &Shell, prompt: Prompt) -> Element<'static, Message> {
     let Prompt::Import(check) = prompt else {
         return space().into();
     };
@@ -2085,19 +3078,15 @@ fn import_prompt(scheme: Scheme, prompt: Prompt) -> Element<'static, Message> {
             .color(t.text_2),
         );
     }
-    column = column.push(
-        row![
-            button(control_label("Cancel"))
-                .on_press(Message::Machine(Msg::ImportCancel))
-                .style(theme::secondary_button(scheme))
-                .height(CONTROL_HEIGHT),
-            button(control_label("Import"))
-                .on_press(Message::Machine(Msg::ImportConfirm))
-                .style(theme::primary_button(scheme))
-                .height(CONTROL_HEIGHT),
-        ]
-        .spacing(12),
-    );
+    let cancel = shell
+        .modal_control(control_label("Cancel"), theme::secondary_surface(*t))
+        .height(CONTROL_HEIGHT)
+        .on_press(Message::Machine(Msg::ImportCancel));
+    let confirm = shell
+        .modal_control(control_label("Import"), theme::primary_surface(*t))
+        .height(CONTROL_HEIGHT)
+        .on_press(Message::Machine(Msg::ImportConfirm));
+    column = column.push(row![cancel, confirm].spacing(12));
     column.into()
 }
 
@@ -2138,20 +3127,16 @@ fn lift_off_label(lift_off: gctl_proto::LiftOff) -> String {
     format!("{} mm", parse::format_lift_off(lift_off))
 }
 
-/// The rate a picker label names, from the same list the picker offers.
+/// The rate a picker label names, parsed off the label's number through the
+/// CLI grammar rather than compared against a formatted label.
 fn polling_rate_of(label: &str) -> Option<gctl_proto::PollingRate> {
-    POLLING_RATES
-        .iter()
-        .copied()
-        .find(|rate| polling_label(*rate) == label)
+    parse::polling_rate(label.strip_suffix(" Hz")?).ok()
 }
 
-/// The distance a picker label names, from the same list the picker offers.
+/// The distance a picker label names, parsed off the label's number through
+/// the CLI grammar.
 fn lift_off_of(label: &str) -> Option<gctl_proto::LiftOff> {
-    LIFT_OFFS
-        .iter()
-        .copied()
-        .find(|lift_off| lift_off_label(*lift_off) == label)
+    parse::lift_off(label.strip_suffix(" mm")?).ok()
 }
 
 /// The edit a polling-rate picker option produces: its rate, or an invalid
@@ -2180,15 +3165,16 @@ fn scroll_of(invert: bool) -> gctl_proto::ScrollDirection {
     }
 }
 
-fn color_swatch(scheme: Scheme, color: gctl_proto::Rgb) -> Element<'static, Message> {
-    let line = scheme.tokens().line;
+fn color_swatch(look: Look, color: gctl_proto::Rgb) -> Element<'static, Message> {
+    let line = look.tokens().line;
+    let alpha = look.alpha;
     container(space())
         .width(18)
         .height(18)
         .style(move |_theme| container::Style {
-            background: Some(Background::Color(Color::from_rgb8(
-                color.r, color.g, color.b,
-            ))),
+            background: Some(Background::Color(
+                Color::from_rgb8(color.r, color.g, color.b).scale_alpha(alpha),
+            )),
             border: Border {
                 radius: 4.0.into(),
                 width: 1.0,
@@ -2197,6 +3183,32 @@ fn color_swatch(scheme: Scheme, color: gctl_proto::Rgb) -> Element<'static, Mess
             ..container::Style::default()
         })
         .into()
+}
+
+/// Whether the chosen effect draws colour rows at all.
+fn takes_colours(kind: Option<EffectKind>) -> bool {
+    matches!(
+        kind,
+        Some(EffectKind::Pulse | EffectKind::Rave | EffectKind::Solid | EffectKind::PulseOne)
+    )
+}
+
+/// The most colours the chosen effect takes.
+fn max_effect_colors(kind: Option<EffectKind>) -> usize {
+    match kind {
+        Some(EffectKind::Pulse) => 6,
+        Some(EffectKind::Rave) => 2,
+        Some(
+            EffectKind::Off
+            | EffectKind::Glorious
+            | EffectKind::Cycle
+            | EffectKind::Solid
+            | EffectKind::PulseOne
+            | EffectKind::Tail
+            | EffectKind::Wave,
+        )
+        | None => 1,
+    }
 }
 
 fn min_effect_colors(kind: Option<EffectKind>) -> usize {
@@ -2214,32 +3226,6 @@ fn min_effect_colors(kind: Option<EffectKind>) -> usize {
         )
         | None => 1,
     }
-}
-
-fn fn_picker(
-    scheme: Scheme,
-    names: &'static [&'static str],
-    family: parse::BindCategory,
-    binding: Option<Binding>,
-    button: Button,
-) -> Element<'static, Message> {
-    let family_token = parse::family_token(family);
-    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-    let current = binding.and_then(|binding| {
-        let text = parse::format_binding(binding);
-        let name = text.strip_prefix(family_token)?.strip_prefix(':')?;
-        Some(name.to_owned())
-    });
-    pick_list(names, current, move |name| {
-        let edit = bind_edit(button, &format!("{family_token}:{name}"));
-        Message::Machine(Msg::Edit(edit))
-    })
-    .style(theme::pick_list(scheme))
-    .menu_style(theme::pick_menu(scheme))
-    .text_size(14)
-    .padding([9.0, 12.0])
-    .width(KEY_PICKER_WIDTH)
-    .into()
 }
 
 /// The edit a picker composition produces: a valid bind, or `InvalidBind` when
@@ -2288,8 +3274,11 @@ fn default_binding(button: Button, category: parse::BindCategory) -> Edit {
     }
 }
 
-fn key_names() -> Vec<&'static str> {
-    gctl_proto::Key::all().map(gctl_proto::Key::name).collect()
+fn key_names() -> Vec<String> {
+    gctl_proto::Key::all()
+        .map(gctl_proto::Key::name)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// One brightness row's grid cells: a dimmed slider with its handle at 0 and
@@ -2299,19 +3288,20 @@ fn key_names() -> Vec<&'static str> {
 /// The slider carries `id`, so a test can find its bounds by layout id rather
 /// than by the label.
 fn brightness_row(
-    scheme: Scheme,
+    look: Look,
     id: &'static str,
     value: Option<u8>,
     on_change: impl Fn(u8) -> Message + 'static,
     release: Edit,
 ) -> (Element<'static, Message>, Element<'static, Message>, bool) {
+    let t = look.tokens();
     match value {
         Some(value) => {
             let slider = container(
                 slider(0..=255, value, on_change)
                     .width(Length::Fill)
                     .height(CONTROL_HEIGHT)
-                    .style(theme::slider(scheme)),
+                    .style(theme::slider_at(t)),
             )
             .width(Length::Fill)
             .id(id);
@@ -2326,7 +3316,7 @@ fn brightness_row(
                 slider(0..=255, 0, on_change)
                     .width(Length::Fill)
                     .height(CONTROL_HEIGHT)
-                    .style(theme::dim_slider(scheme))
+                    .style(theme::dim_slider_at(t))
                     .on_release(Message::Machine(Msg::Edit(release))),
             )
             .width(Length::Fill)
@@ -2339,3 +3329,23 @@ fn brightness_row(
 #[cfg(test)]
 #[path = "../../tests/unit/gui_view.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/gui_motion_marks.rs"]
+mod motion_marks;
+
+#[cfg(test)]
+#[path = "../../tests/unit/gui_motion_ghosts.rs"]
+mod motion_ghosts;
+
+#[cfg(test)]
+#[path = "../../tests/unit/gui_motion_desktop.rs"]
+mod motion_desktop;
+
+#[cfg(test)]
+#[path = "../../tests/unit/gui_motion_tints.rs"]
+mod motion_tints;
+
+#[cfg(test)]
+#[path = "../../tests/unit/gui_layout_link_line.rs"]
+mod layout_link_line;

@@ -7,7 +7,13 @@ use iced::Rectangle;
 
 use super::*;
 
-const TAGS: [&str; 4] = ["all profiles", "per profile", "last set by gctl", "Unknown"];
+const TAGS: [&str; 5] = [
+    "all profiles",
+    "per profile",
+    "last set by gctl",
+    "Unknown",
+    "Colour unknown",
+];
 
 /// Everything left of this x is the sidebar, which is not part of the grid.
 const PANE_LEFT: f32 = 230.0;
@@ -161,12 +167,11 @@ fn panes() -> Vec<(String, Section, Shell)> {
 /// Row labels only some states show: the effect's speed and colour list.
 const OPTIONAL_LABELS: [&str; 2] = ["Speed", "Colours"];
 
-/// The row labels each pane shows in every state. A card title shares the
-/// label column, so `Effect` and `Scroll` match their title and their row.
+/// The row labels each pane shows in every state. Card titles are caps
+/// eyebrows, so `Effect` and `Scroll` match their row alone.
 fn labels(section: Section) -> &'static [&'static str] {
     match section {
         Section::Performance => &[
-            "DPI stages",
             "Stage 1",
             "Stage 2",
             "Stage 3",
@@ -541,7 +546,7 @@ fn every_action_button_hugs_its_label() {
         profile: profile(3),
         ..snapshot()
     })));
-    cases.push(("make active", make_active, vec!["Make active"]));
+    cases.push(("make active", make_active, vec!["Make 3 active"]));
     let mut machine = State::new().0;
     machine.update(Msg::Loaded(Ok(snapshot())));
     machine.update(Msg::Edit(Edit::Debounce(0)));
@@ -673,4 +678,266 @@ fn the_footer_stays_pinned_inside_the_shipped_window_on_every_pane() {
         .count();
     assert!(lines >= 1, "the moved lines are drawn");
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+// --- the sidebar and the controls ----------------------------------------------
+
+/// Everything the simulator reports left of the pane: texts, and containers
+/// with the id they carry (`None` for buttons and unnamed containers).
+fn sidebar(shell: &Shell) -> (Vec<Placed>, Vec<(Option<iced::widget::Id>, Rectangle)>) {
+    let mut ui = simulator(shell.view());
+    let mut texts = Vec::new();
+    let mut boxes = Vec::new();
+    let _ = ui.find(|candidate: iced_test::selector::Candidate<'_>| {
+        match candidate {
+            iced_test::selector::Candidate::Text {
+                content, bounds, ..
+            } if bounds.x < PANE_LEFT => texts.push(Placed {
+                content: content.to_owned(),
+                bounds,
+            }),
+            iced_test::selector::Candidate::Container { id, bounds, .. }
+                if bounds.x < PANE_LEFT =>
+            {
+                boxes.push((id.cloned(), bounds));
+            }
+            _ => {}
+        }
+        None::<()>
+    });
+    (texts, boxes)
+}
+
+fn by_id(boxes: &[(Option<iced::widget::Id>, Rectangle)], id: &'static str) -> Vec<Rectangle> {
+    let want = iced::widget::Id::new(id);
+    boxes
+        .iter()
+        .filter(|(found, _)| found.as_ref() == Some(&want))
+        .map(|(_, bounds)| *bounds)
+        .collect()
+}
+
+/// The window on profile 3 while profile 2 stays the active one.
+fn editing_three() -> Shell {
+    let mut shell = shell(snapshot());
+    shell.machine.update(Msg::PickProfile(profile(3)));
+    shell.machine.update(Msg::Loaded(Ok(Snapshot {
+        profile: profile(3),
+        ..snapshot()
+    })));
+    shell
+}
+
+/// The profile picker is one segmented control: three equal segments side by
+/// side, each digit's glyph box centred in its segment (the session-8 frame
+/// had the selected digit ~3 px left of centre).
+#[test]
+fn each_profile_digit_sits_centred_in_one_segmented_control() {
+    let mut wrong = Vec::new();
+    for (case, shell) in [
+        ("edited 2", shell(snapshot())),
+        ("edited 3", editing_three()),
+    ] {
+        let (texts, boxes) = sidebar(&shell);
+        let mut segments: Vec<Rectangle> = [
+            "edited-profile",
+            "profile-pick-1",
+            "profile-pick-2",
+            "profile-pick-3",
+        ]
+        .into_iter()
+        .flat_map(|id| by_id(&boxes, id))
+        .collect();
+        assert_eq!(segments.len(), 3, "{case}: segments {segments:?}");
+        segments.sort_by(|a, b| a.x.total_cmp(&b.x));
+        for (index, segment) in segments.iter().enumerate() {
+            let digit = (index + 1).to_string();
+            let inside: Vec<&Placed> = texts
+                .iter()
+                .filter(|p| p.content == digit && encloses(segment, &p.bounds))
+                .collect();
+            assert_eq!(inside.len(), 1, "{case}: digit {digit} in {segment:?}");
+            let glyphs = inside[0].bounds;
+            if glyphs.width >= segment.width / 2.0 {
+                wrong.push(format!(
+                    "{case} {digit}: text box {:.1} wide in a {:.1} segment, not its glyphs",
+                    glyphs.width, segment.width
+                ));
+            }
+            let dx = (glyphs.x + glyphs.width / 2.0) - (segment.x + segment.width / 2.0);
+            let dy = centre_y(&glyphs) - centre_y(segment);
+            if dx.abs() > 0.5 || dy.abs() > 0.5 {
+                wrong.push(format!("{case} {digit}: off centre by {dx:.2},{dy:.2}"));
+            }
+        }
+        for pair in segments.windows(2) {
+            let (left, right) = (pair[0], pair[1]);
+            let gap = right.x - (left.x + left.width);
+            if !(-0.5..=2.0).contains(&gap)
+                || (left.width - right.width).abs() > 0.5
+                || (left.height - right.height).abs() > 0.5
+                || (left.y - right.y).abs() > 0.5
+            {
+                wrong.push(format!(
+                    "{case}: segments {left:?} and {right:?} are not one control"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The sidebar's header, its eyebrows and its section rows share one left
+/// edge (the session-8 frame had the header at x 16 and the rows' text at
+/// x 50): the model name, the link eyebrow, the `Profile` and `Settings`
+/// eyebrows and the section rows' dot start at one x, and every row's label
+/// starts just right of the dot.
+#[test]
+fn the_sidebar_header_eyebrows_and_section_rows_share_one_left_edge() {
+    for (case, shell) in [
+        ("edited 2", shell(snapshot())),
+        ("edited 3", editing_three()),
+    ] {
+        let (texts, boxes) = sidebar(&shell);
+        let mut lefts = Vec::new();
+        for content in [
+            "Model O Wireless".to_owned(),
+            eyebrow("Wireless"),
+            eyebrow("Profile"),
+            eyebrow("Settings"),
+        ] {
+            let found: Vec<&Placed> = texts.iter().filter(|p| p.content == content).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "{case}: {content:?} found {} times",
+                found.len()
+            );
+            lefts.push((format!("{case} {content:?}"), found[0].bounds.x));
+        }
+        let dot = by_id(&boxes, "section-dot");
+        assert_eq!(dot.len(), 1, "{case}: section dots {dot:?}");
+        lefts.push((format!("{case} section dot"), dot[0].x));
+        all_agree("sidebar left edge", &lefts);
+
+        let dot_right = dot[0].x + dot[0].width;
+        let mut labels = Vec::new();
+        for section in SECTIONS {
+            let label = match section {
+                Section::Performance => "Performance",
+                Section::Lighting => "Lighting",
+                Section::Buttons => "Buttons",
+                Section::Device => "Device",
+            };
+            let found: Vec<&Placed> = texts.iter().filter(|p| p.content == label).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "{case}: {label:?} found {} times",
+                found.len()
+            );
+            let x = found[0].bounds.x;
+            assert!(
+                (dot_right..=dot_right + 16.0).contains(&x),
+                "{case}: {label:?} starts at {x}, the dot ends at {dot_right}"
+            );
+            labels.push((format!("{case} {label:?}"), x));
+        }
+        all_agree("section label column", &labels);
+    }
+}
+
+/// Each pane's card titles, as eyebrows.
+fn card_titles(section: Section) -> [&'static str; 2] {
+    match section {
+        Section::Performance => ["DPI", "Sensor"],
+        Section::Lighting => ["Effect", "Brightness"],
+        Section::Buttons => ["Scroll", "Buttons"],
+        Section::Device => ["Mouse", "Profile file"],
+    }
+}
+
+/// Every card title is a caps eyebrow starting in the label column, and the
+/// DPI card has no `DPI stages` row repeating its title: the stage list's
+/// `per profile` tag rides the title's row instead.
+#[test]
+fn card_titles_are_eyebrows_in_the_label_column() {
+    let mut lefts = Vec::new();
+    for (pane, section, shell) in panes() {
+        let placed = texts(&shell);
+        for title in card_titles(section) {
+            let title = eyebrow(title);
+            let found: Vec<&Placed> = placed.iter().filter(|p| p.content == title).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "{pane}: {title:?} found {} times",
+                found.len()
+            );
+            lefts.push((format!("{pane} {title:?}"), found[0].bounds.x));
+        }
+        let first = labels(section)[0];
+        lefts.push((format!("{pane} {first:?}"), one(&placed, first).bounds.x));
+        if section == Section::Performance {
+            assert!(
+                placed.iter().all(|p| p.content != "DPI stages"),
+                "{pane}: a DPI stages row"
+            );
+            let dpi = one(&placed, &eyebrow("DPI"));
+            let y = centre_y(&dpi.bounds);
+            assert!(
+                placed
+                    .iter()
+                    .any(|p| p.content == "per profile" && (centre_y(&p.bounds) - y).abs() < 6.0),
+                "{pane}: no per profile tag on the DPI title's row"
+            );
+        }
+    }
+    all_agree("card title column", &lefts);
+}
+
+/// The Performance pane's single-value controls share one width and start in
+/// the control column: each stage's DPI input, the active stage, polling and
+/// lift-off pickers (the session-8 frame had them at 110 / 150 / 108 / 85 px).
+#[test]
+fn the_performance_value_controls_share_one_width() {
+    for (state, snap) in [("empty", snapshot()), ("remembered", remembered())] {
+        let shell = on_section(snap, Section::Performance);
+        let placed = texts(&shell);
+        let mut ui = simulator(shell.view());
+        let mut boxes: Vec<(Option<iced::widget::Id>, Rectangle)> = Vec::new();
+        let _ = ui.find(|candidate: iced_test::selector::Candidate<'_>| {
+            if let iced_test::selector::Candidate::Container { id, bounds, .. } = candidate {
+                boxes.push((id.cloned(), bounds));
+            }
+            None::<()>
+        });
+        let mut controls: Vec<(String, Rectangle)> = Vec::new();
+        for stage in ["Stage 1", "Stage 2", "Stage 3"] {
+            let y = centre_y(&one(&placed, stage).bounds);
+            let first = inputs(&shell)
+                .into_iter()
+                .filter(|bounds| (centre_y(bounds) - y).abs() < 12.0)
+                .min_by(|a, b| a.x.total_cmp(&b.x));
+            let Some(first) = first else {
+                panic!("{state}: no input on the {stage:?} row");
+            };
+            controls.push((format!("{state} {stage:?} input"), first));
+        }
+        for id in ["active-stage-picker", "polling-picker", "lift-off-picker"] {
+            let found = by_id(&boxes, id);
+            assert_eq!(found.len(), 1, "{state}: {id} found {} times", found.len());
+            controls.push((format!("{state} {id}"), found[0]));
+        }
+        let widths: Vec<(String, f32)> = controls
+            .iter()
+            .map(|(name, bounds)| (name.clone(), bounds.width))
+            .collect();
+        all_agree("value control width", &widths);
+        let lefts: Vec<(String, f32)> = controls
+            .iter()
+            .map(|(name, bounds)| (name.clone(), bounds.x))
+            .collect();
+        all_agree("value control left edge", &lefts);
+    }
 }

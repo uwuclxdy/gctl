@@ -16,7 +16,14 @@ iced = { version = "0.14", default-features = false, features = [
     "x11",
     "tokio",
     "crisp",
+    "advanced",
     "linux-theme-detection",
+] }
+# The portal's (and GNOME's) reduced-motion flag. iced already pulls this crate
+# for the colour scheme; the `reduced-motion` feature is what gctl adds.
+mundy = { version = "0.2", default-features = false, features = [
+    "reduced-motion",
+    "async-io",
 ] }
 serde.workspace = true
 thiserror.workspace = true

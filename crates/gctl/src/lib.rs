@@ -186,6 +186,18 @@ pub fn lock_path(
     Some(state_dir.join("gctl.lock"))
 }
 
+/// The KDE configuration file the window's animation factor lives in:
+/// `$XDG_CONFIG_HOME/kdeglobals`, else `$HOME/.config/kdeglobals`. An empty or
+/// relative variable counts as unset; `None` when neither is usable. `var` is
+/// `std::env::var_os` in `main`.
+pub fn kdeglobals_path(var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if let Some(config) = var("XDG_CONFIG_HOME").and_then(absolute) {
+        return Some(config.join("kdeglobals"));
+    }
+    let home = var("HOME").and_then(absolute)?;
+    Some(home.join(".config").join("kdeglobals"))
+}
+
 /// Opens (creating it and its dir) and exclusively locks the lock file at
 /// `path`. While another process holds it, prints `waiting for another gctl to
 /// finish` on `stderr` and blocks. Every error reads `could not lock "<path>": <cause>`.

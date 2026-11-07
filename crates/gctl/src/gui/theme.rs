@@ -3,15 +3,27 @@
 use iced::theme::palette::Palette;
 use iced::theme::{Mode, Theme};
 use iced::widget::{
-    button, checkbox as checkbox_widget, container, pick_list as pick_list_widget, rule,
-    scrollable as scrollable_widget, slider as slider_widget, text_input as text_input_widget,
-    toggler as toggler_widget,
+    button, checkbox as checkbox_widget, container, rule, scrollable as scrollable_widget,
+    slider as slider_widget, text_input as text_input_widget, toggler as toggler_widget,
 };
 use iced::{Background, Border, Color, Font, Shadow, Vector};
+
+/// Onest, the UI face, as shipped in the binary.
+static ONEST: &[u8] = include_bytes!("../../fonts/Onest-Variable.ttf");
+/// JetBrains Mono, the numeric readouts' face.
+static JETBRAINS_MONO: &[u8] = include_bytes!("../../fonts/JetBrainsMono-Variable.ttf");
+
+/// The font files the window loads at start and every test simulator loads, so
+/// no text falls back to the desktop's sans.
+pub(crate) const FONTS: &[&[u8]] = &[ONEST, JETBRAINS_MONO];
 
 #[cfg(test)]
 #[path = "../../tests/unit/gui_theme.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/gui_surfaces.rs"]
+mod surface_tests;
 
 /// One colour scheme. The window starts dark and follows the desktop's mode
 /// once the runtime answers.
@@ -91,6 +103,41 @@ pub(crate) struct Tokens {
 
 const fn rgb(hex: u32) -> Color {
     Color::from_rgb8((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+impl Tokens {
+    /// The whole palette at a fraction of its opacity: iced has no subtree
+    /// opacity, so a fading card threads one alpha into every colour it paints.
+    pub(crate) fn scale_alpha(&self, alpha: f32) -> Tokens {
+        let f = |color: Color| color.scale_alpha(alpha);
+        Tokens {
+            well: f(self.well),
+            bg: f(self.bg),
+            surface_1: f(self.surface_1),
+            surface_2: f(self.surface_2),
+            surface_3: f(self.surface_3),
+            line: f(self.line),
+            line_soft: f(self.line_soft),
+            text: f(self.text),
+            text_2: f(self.text_2),
+            text_3: f(self.text_3),
+            text_4: f(self.text_4),
+            accent: f(self.accent),
+            accent_hover: f(self.accent_hover),
+            accent_press: f(self.accent_press),
+            accent_text: f(self.accent_text),
+            accent_quiet: f(self.accent_quiet),
+            accent_line: f(self.accent_line),
+            on_accent: f(self.on_accent),
+            success: f(self.success),
+            warning: f(self.warning),
+            danger: f(self.danger),
+            danger_text: f(self.danger_text),
+            on_danger: f(self.on_danger),
+            backdrop: f(self.backdrop),
+            shadow: f(self.shadow),
+        }
+    }
 }
 
 const fn rgba(hex: u32, alpha: f32) -> Color {
@@ -174,7 +221,7 @@ static LIGHT: Tokens = Tokens {
     // --text-3
     text_3: rgb(0x60636E),
     // --text-4
-    text_4: rgb(0x676A74),
+    text_4: rgb(0x656771),
     // --accent
     accent: rgb(0x007AB9),
     // --accent-hover
@@ -218,9 +265,34 @@ pub(crate) const RADIUS_MODAL: f32 = 18.0;
 pub(crate) const CONTROL_HEIGHT: f32 = 36.0;
 
 /// A translucent tint of `color`, for the status tags and the warning badge.
+/// The tint multiplies the colour's own alpha, so a fading surface's tint fades
+/// with it.
 fn tint(color: Color, alpha: f32) -> Color {
-    let [r, g, b, _] = color.into_rgba8();
-    Color::from_rgba8(r, g, b, alpha)
+    let mut tinted = color;
+    tinted.a *= alpha;
+    tinted
+}
+
+/// A control's hover surface at the fade `hover` (0 at rest, 1 hovered): the
+/// button's own status snaps, so the paint takes the shell's eased alpha.
+fn hovered(rest: Option<Color>, hover: Color, alpha: f32) -> Option<Color> {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let rest = rest.unwrap_or(Color::TRANSPARENT);
+    (rest.a > 0.0 || alpha > 0.0).then(|| mix(rest, hover, alpha))
+}
+
+/// `a` at `t = 0`, `b` at `t = 1`, straight through the channels: the one way
+/// a colour moves between two tokens (a field rising into its open fill, an
+/// edge settling to the accent).
+pub(crate) fn mix(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: f32, y: f32| x + (y - x) * t;
+    Color {
+        r: lerp(a.r, b.r),
+        g: lerp(a.g, b.g),
+        b: lerp(a.b, b.b),
+        a: lerp(a.a, b.a),
+    }
 }
 
 fn control_radius() -> Border {
@@ -230,169 +302,342 @@ fn control_radius() -> Border {
     }
 }
 
+/// The paint under a control, from its eased hover and its state. The control
+/// widget draws it at its own clock, so no style is closed over a hover that
+/// goes stale between rebuilds.
+pub(crate) type Surface<'a> = Box<dyn Fn(f32, button::Status) -> button::Style + 'a>;
+
 // --- buttons ------------------------------------------------------------------
 
 /// The one filled button: accent fill, on-accent label.
+#[cfg(test)]
 pub(crate) fn filled_button(scheme: Scheme) -> button::StyleFn<'static, Theme> {
-    Box::new(move |_theme, status| {
-        let t = scheme.tokens();
-        let (background, text_color) = match status {
-            button::Status::Active => (Some(t.accent), t.on_accent),
-            button::Status::Hovered => (Some(t.accent_hover), t.on_accent),
-            button::Status::Pressed => (Some(t.accent_press), t.on_accent),
-            button::Status::Disabled => (Some(t.surface_2), t.text_4),
-        };
-        button::Style {
-            background: background.map(Background::Color),
-            text_color,
-            border: control_radius(),
-            ..button::Style::default()
+    filled_button_at(*scheme.tokens(), 0.0)
+}
+
+fn filled(t: Tokens, hover: f32, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Active | button::Status::Hovered => {
+            (hovered(Some(t.accent), t.accent_hover, hover), t.on_accent)
         }
-    })
+        button::Status::Pressed => (Some(t.accent_press), t.on_accent),
+        button::Status::Disabled => (Some(t.surface_2), t.text_4),
+    };
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: control_radius(),
+        ..button::Style::default()
+    }
+}
+
+pub(crate) fn filled_surface(t: Tokens) -> Surface<'static> {
+    Box::new(move |hover, status| filled(t, hover, status))
+}
+
+#[cfg(test)]
+pub(crate) fn filled_button_at(t: Tokens, hover: f32) -> button::StyleFn<'static, Theme> {
+    Box::new(move |_theme, status| filled(t, hover, status))
 }
 
 /// An outlined primary: accent-quiet fill, accent-text label, accent-line edge.
+#[cfg(test)]
 pub(crate) fn primary_button(scheme: Scheme) -> button::StyleFn<'static, Theme> {
-    Box::new(move |_theme, status| {
-        let t = scheme.tokens();
-        let (background, text_color, border_color) = match status {
-            button::Status::Active => (Some(t.accent_quiet), t.accent_text, t.accent_line),
-            button::Status::Hovered => (Some(t.surface_2), t.accent_text, t.accent_line),
-            button::Status::Pressed => (Some(t.surface_3), t.accent_text, t.accent_line),
-            button::Status::Disabled => (Some(t.surface_2), t.text_4, t.surface_3),
-        };
-        button::Style {
-            background: background.map(Background::Color),
-            text_color,
-            border: Border {
-                radius: RADIUS_CONTROL.into(),
-                width: 1.0,
-                color: border_color,
-            },
-            ..button::Style::default()
-        }
-    })
+    primary_button_at(*scheme.tokens(), 0.0)
+}
+
+pub(crate) fn primary_surface(t: Tokens) -> Surface<'static> {
+    Box::new(move |hover, status| primary(t, hover, status))
+}
+
+#[cfg(test)]
+pub(crate) fn primary_button_at(t: Tokens, hover: f32) -> button::StyleFn<'static, Theme> {
+    Box::new(move |_theme, status| primary(t, hover, status))
+}
+
+fn primary(t: Tokens, hover: f32, status: button::Status) -> button::Style {
+    let (background, text_color, border_color) = match status {
+        button::Status::Active | button::Status::Hovered => (
+            hovered(Some(t.accent_quiet), t.surface_2, hover),
+            t.accent_text,
+            t.accent_line,
+        ),
+        button::Status::Pressed => (Some(t.surface_3), t.accent_text, t.accent_line),
+        button::Status::Disabled => (Some(t.surface_2), t.text_4, t.surface_3),
+    };
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: Border {
+            radius: RADIUS_CONTROL.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        ..button::Style::default()
+    }
 }
 
 /// A secondary button: transparent with a surface-3 edge.
+#[cfg(test)]
 pub(crate) fn secondary_button(scheme: Scheme) -> button::StyleFn<'static, Theme> {
-    Box::new(move |_theme, status| {
-        let t = scheme.tokens();
-        let (background, text_color, border_color) = match status {
-            button::Status::Active => (None, t.text, t.surface_3),
-            button::Status::Hovered => (Some(t.surface_2), t.text, t.surface_3),
-            button::Status::Pressed => (Some(t.surface_3), t.text, t.surface_3),
-            button::Status::Disabled => (None, t.text_4, t.line),
-        };
-        button::Style {
-            background: background.map(Background::Color),
-            text_color,
-            border: Border {
-                radius: RADIUS_CONTROL.into(),
-                width: 1.0,
-                color: border_color,
-            },
-            ..button::Style::default()
+    secondary_button_at(*scheme.tokens(), 0.0)
+}
+
+pub(crate) fn secondary_surface(t: Tokens) -> Surface<'static> {
+    Box::new(move |hover, status| secondary(t, hover, status))
+}
+
+#[cfg(test)]
+pub(crate) fn secondary_button_at(t: Tokens, hover: f32) -> button::StyleFn<'static, Theme> {
+    Box::new(move |_theme, status| secondary(t, hover, status))
+}
+
+fn secondary(t: Tokens, hover: f32, status: button::Status) -> button::Style {
+    let (background, text_color, border_color) = match status {
+        button::Status::Active | button::Status::Hovered => {
+            (hovered(None, t.surface_2, hover), t.text, t.surface_3)
         }
-    })
+        button::Status::Pressed => (Some(t.surface_3), t.text, t.surface_3),
+        button::Status::Disabled => (None, t.text_4, t.line),
+    };
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: Border {
+            radius: RADIUS_CONTROL.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        ..button::Style::default()
+    }
 }
 
 /// The outside-change banner's Dismiss: a secondary button edged in the warning
 /// tone, so its outline shows on the banner tint; never filled.
+#[cfg(test)]
 pub(crate) fn warning_button(scheme: Scheme) -> button::StyleFn<'static, Theme> {
-    Box::new(move |_theme, status| {
-        let t = scheme.tokens();
-        let (background, text_color, border_color) = match status {
-            button::Status::Active => (None, t.text, t.warning),
-            button::Status::Hovered => (Some(t.surface_2), t.text, t.warning),
-            button::Status::Pressed => (Some(t.surface_3), t.text, t.warning),
-            button::Status::Disabled => (None, t.text_4, t.line),
-        };
-        button::Style {
-            background: background.map(Background::Color),
-            text_color,
-            border: Border {
-                radius: RADIUS_CONTROL.into(),
-                width: 1.0,
-                color: border_color,
-            },
-            ..button::Style::default()
+    warning_button_at(*scheme.tokens(), 0.0)
+}
+
+pub(crate) fn warning_surface(t: Tokens) -> Surface<'static> {
+    Box::new(move |hover, status| warning(t, hover, status))
+}
+
+#[cfg(test)]
+pub(crate) fn warning_button_at(t: Tokens, hover: f32) -> button::StyleFn<'static, Theme> {
+    Box::new(move |_theme, status| warning(t, hover, status))
+}
+
+fn warning(t: Tokens, hover: f32, status: button::Status) -> button::Style {
+    let (background, text_color, border_color) = match status {
+        button::Status::Active | button::Status::Hovered => {
+            (hovered(None, t.surface_2, hover), t.text, t.warning)
         }
-    })
+        button::Status::Pressed => (Some(t.surface_3), t.text, t.warning),
+        button::Status::Disabled => (None, t.text_4, t.line),
+    };
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: Border {
+            radius: RADIUS_CONTROL.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        ..button::Style::default()
+    }
 }
 
 /// An outlined danger button: danger edge, danger label stepping to danger-text
 /// on hover and press.
+#[cfg(test)]
 pub(crate) fn danger_button(scheme: Scheme) -> button::StyleFn<'static, Theme> {
-    Box::new(move |_theme, status| {
-        let t = scheme.tokens();
-        let (background, text_color, border_color) = match status {
-            button::Status::Active => (None, t.danger, t.danger),
-            button::Status::Hovered => (Some(tint(t.danger, 0.14)), t.danger_text, t.danger),
-            button::Status::Pressed => (Some(tint(t.danger, 0.22)), t.danger_text, t.danger),
-            button::Status::Disabled => (None, t.text_4, t.line),
-        };
-        button::Style {
-            background: background.map(Background::Color),
-            text_color,
-            border: Border {
-                radius: RADIUS_CONTROL.into(),
-                width: 1.0,
-                color: border_color,
-            },
-            ..button::Style::default()
-        }
-    })
+    danger_button_at(*scheme.tokens(), 0.0)
 }
 
-/// A quiet (ghost) button: no fill or edge at rest, a surface on hover.
+pub(crate) fn danger_surface(t: Tokens) -> Surface<'static> {
+    Box::new(move |hover, status| danger(t, hover, status))
+}
+
+#[cfg(test)]
+pub(crate) fn danger_button_at(t: Tokens, hover: f32) -> button::StyleFn<'static, Theme> {
+    Box::new(move |_theme, status| danger(t, hover, status))
+}
+
+fn danger(t: Tokens, hover: f32, status: button::Status) -> button::Style {
+    let (background, text_color, border_color) = match status {
+        button::Status::Active | button::Status::Hovered => (
+            hovered(None, tint(t.danger, 0.14), hover),
+            mix(t.danger, t.danger_text, hover),
+            t.danger,
+        ),
+        button::Status::Pressed => (Some(tint(t.danger, 0.22)), t.danger_text, t.danger),
+        button::Status::Disabled => (None, t.text_4, t.line),
+    };
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: Border {
+            radius: RADIUS_CONTROL.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        ..button::Style::default()
+    }
+}
+
+/// A quiet button: a hairline edge at rest, a surface on hover and press. It
+/// draws a silhouette, so no action reads as bare text.
+#[cfg(test)]
 pub(crate) fn quiet_button(scheme: Scheme) -> button::StyleFn<'static, Theme> {
-    Box::new(move |_theme, status| {
-        let t = scheme.tokens();
-        let (background, text_color) = match status {
-            button::Status::Active => (None, t.text_2),
-            button::Status::Hovered => (Some(t.surface_2), t.text_2),
-            button::Status::Pressed => (Some(t.surface_3), t.text_2),
-            button::Status::Disabled => (None, t.text_4),
-        };
-        button::Style {
-            background: background.map(Background::Color),
-            text_color,
-            border: control_radius(),
-            ..button::Style::default()
+    quiet_button_at(*scheme.tokens(), 0.0)
+}
+
+pub(crate) fn quiet_surface(t: Tokens) -> Surface<'static> {
+    Box::new(move |hover, status| quiet(t, hover, status))
+}
+
+#[cfg(test)]
+pub(crate) fn quiet_button_at(t: Tokens, hover: f32) -> button::StyleFn<'static, Theme> {
+    Box::new(move |_theme, status| quiet(t, hover, status))
+}
+
+fn quiet(t: Tokens, hover: f32, status: button::Status) -> button::Style {
+    let (background, text_color, border_color) = match status {
+        button::Status::Active | button::Status::Hovered => {
+            (hovered(None, t.surface_2, hover), t.text_2, t.line)
         }
+        button::Status::Pressed => (Some(t.surface_3), t.text, t.line),
+        button::Status::Disabled => (None, t.text_4, t.line_soft),
+    };
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: Border {
+            radius: RADIUS_CONTROL.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        ..button::Style::default()
+    }
+}
+
+pub(crate) fn nav_surface(t: Tokens, selected: f32) -> Surface<'static> {
+    Box::new(move |hover, status| nav(t, selected, hover, status))
+}
+fn nav(t: Tokens, selected: f32, hover: f32, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Active | button::Status::Hovered => {
+            let rest = t.accent_quiet.scale_alpha(selected.clamp(0.0, 1.0));
+            let hover_fill = mix(t.surface_2, t.accent_quiet, selected.clamp(0.0, 1.0));
+            (
+                hovered(Some(rest), hover_fill, hover),
+                mix(t.text, t.accent_text, selected),
+            )
+        }
+        button::Status::Pressed => (Some(t.surface_3), t.text),
+        button::Status::Disabled => (None, t.text_4),
+    };
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: Border {
+            radius: 8.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+// --- segmented control --------------------------------------------------------
+
+/// The track that frames all three profile segments: a well fill inside one
+/// hairline, so the unpicked digits read as part of one control.
+pub(crate) fn segment_track(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
+    segment_track_at(*scheme.tokens())
+}
+
+pub(crate) fn segment_track_at(t: Tokens) -> impl Fn(&Theme) -> container::Style + 'static {
+    move |_theme| container::Style {
+        background: Some(Background::Color(t.well)),
+        border: Border {
+            radius: 12.0.into(),
+            width: 1.0,
+            color: t.line,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The selected segment's capsule, sliding under the digits.
+pub(crate) fn segment_selected(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
+    segment_selected_at(*scheme.tokens())
+}
+
+pub(crate) fn segment_selected_at(t: Tokens) -> impl Fn(&Theme) -> container::Style + 'static {
+    move |_theme| container::Style {
+        background: Some(Background::Color(t.accent_quiet)),
+        border: Border {
+            radius: 8.0.into(),
+            width: 1.0,
+            color: t.accent_line,
+        },
+        ..container::Style::default()
+    }
+}
+
+pub(crate) fn segment_surface(t: Tokens, hovers: bool) -> Surface<'static> {
+    Box::new(move |hover, _status| segment(t, if hovers { hover } else { 0.0 }))
+}
+
+fn segment(t: Tokens, hover: f32) -> button::Style {
+    button::Style {
+        background: hovered(None, t.surface_2, hover).map(Background::Color),
+        text_color: t.text_2,
+        border: Border {
+            radius: 8.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+/// A picker's field: the well's fill, blending toward surface-2 under the
+/// pointer. Its edge belongs to the dropdown, which alone knows whether the
+/// list is open; the fill carries that edge's radius so no square corner shows
+/// outside it.
+pub(crate) fn field_surface(t: Tokens) -> Surface<'static> {
+    Box::new(move |hover, _status| button::Style {
+        background: Some(Background::Color(mix(
+            t.well,
+            t.surface_2,
+            0.35 * hover.clamp(0.0, 1.0),
+        ))),
+        text_color: t.text,
+        border: control_radius(),
+        ..button::Style::default()
     })
 }
 
-/// The edited profile's digit: it keeps its selected look even while picks are
-/// blocked, so the sidebar still marks which profile is being edited.
-pub(crate) fn pick_selected(scheme: Scheme) -> button::StyleFn<'static, Theme> {
-    Box::new(move |_theme, status| {
-        let t = scheme.tokens();
-        let background = match status {
-            button::Status::Pressed => t.surface_3,
-            button::Status::Hovered => t.surface_2,
-            button::Status::Active | button::Status::Disabled => t.accent_quiet,
-        };
-        button::Style {
-            background: Some(Background::Color(background)),
-            text_color: t.accent_text,
-            border: Border {
-                radius: RADIUS_CONTROL.into(),
-                width: 1.0,
-                color: t.accent_line,
-            },
-            ..button::Style::default()
-        }
-    })
+/// The trigger's edge at `open` of the way from the quiet line to the accent.
+pub(crate) fn trigger_edge(t: Tokens, open: f32) -> Border {
+    Border {
+        radius: RADIUS_CONTROL.into(),
+        width: 1.0,
+        color: mix(t.line, t.accent, open.clamp(0.0, 1.0)),
+    }
 }
 
 // --- inputs and pickers -------------------------------------------------------
 
 /// A text input sunk to the well, its focus edge the accent.
+#[cfg(test)]
 pub(crate) fn text_input(scheme: Scheme) -> text_input_widget::StyleFn<'static, Theme> {
+    text_input_at(*scheme.tokens())
+}
+
+pub(crate) fn text_input_at(t: Tokens) -> text_input_widget::StyleFn<'static, Theme> {
     Box::new(move |_theme, status| {
-        let t = scheme.tokens();
         let (border, value) = match status {
             text_input_widget::Status::Active | text_input_widget::Status::Hovered => (
                 Border {
@@ -430,61 +675,11 @@ pub(crate) fn text_input(scheme: Scheme) -> text_input_widget::StyleFn<'static, 
     })
 }
 
-/// A pick list sunk to the well.
-pub(crate) fn pick_list(scheme: Scheme) -> pick_list_widget::StyleFn<'static, Theme> {
-    Box::new(move |_theme, status| {
-        let t = scheme.tokens();
-        let border = match status {
-            pick_list_widget::Status::Active | pick_list_widget::Status::Hovered => Border {
-                radius: RADIUS_CONTROL.into(),
-                width: 1.0,
-                color: t.line,
-            },
-            pick_list_widget::Status::Opened { .. } => Border {
-                radius: RADIUS_CONTROL.into(),
-                width: 2.0,
-                color: t.accent,
-            },
-        };
-        pick_list_widget::Style {
-            text_color: t.text,
-            placeholder_color: t.text_4,
-            handle_color: t.text_3,
-            background: Background::Color(t.well),
-            border,
-        }
-    })
-}
-
-/// The pick list's menu: surface-1, a hairline, an accent-tinted selection.
-pub(crate) fn pick_menu(scheme: Scheme) -> impl Fn(&Theme) -> iced::overlay::menu::Style + 'static {
-    move |_theme| {
-        let t = scheme.tokens();
-        iced::overlay::menu::Style {
-            background: Background::Color(t.surface_1),
-            border: Border {
-                radius: RADIUS_CONTROL.into(),
-                width: 1.0,
-                color: t.line,
-            },
-            text_color: t.text,
-            selected_text_color: t.accent_text,
-            selected_background: Background::Color(t.accent_quiet),
-            shadow: Shadow {
-                color: t.shadow,
-                offset: Vector::new(0.0, 4.0),
-                blur_radius: 18.0,
-            },
-        }
-    }
-}
-
 // --- sliders, toggles, checkboxes --------------------------------------------
 
 /// A live slider: accent fill over a well rail.
-pub(crate) fn slider(scheme: Scheme) -> slider_widget::StyleFn<'static, Theme> {
+pub(crate) fn slider_at(t: Tokens) -> slider_widget::StyleFn<'static, Theme> {
     Box::new(move |_theme, status| {
-        let t = scheme.tokens();
         let handle_color = match status {
             slider_widget::Status::Active => t.accent,
             slider_widget::Status::Hovered => t.accent_hover,
@@ -511,35 +706,41 @@ pub(crate) fn slider(scheme: Scheme) -> slider_widget::StyleFn<'static, Theme> {
 
 /// A dimmed slider for a write-only value with nothing remembered: the
 /// disabled toggle's tones, clearing 3:1 against its rail and the card.
+#[cfg(test)]
 pub(crate) fn dim_slider(scheme: Scheme) -> slider_widget::StyleFn<'static, Theme> {
-    Box::new(move |_theme, _status| {
-        let t = scheme.tokens();
-        slider_widget::Style {
-            rail: slider_widget::Rail {
-                backgrounds: (
-                    Background::Color(t.surface_2),
-                    Background::Color(t.surface_2),
-                ),
-                width: 4.0,
-                border: Border {
-                    radius: 999.0.into(),
-                    ..Border::default()
-                },
+    dim_slider_at(*scheme.tokens())
+}
+
+pub(crate) fn dim_slider_at(t: Tokens) -> slider_widget::StyleFn<'static, Theme> {
+    Box::new(move |_theme, _status| slider_widget::Style {
+        rail: slider_widget::Rail {
+            backgrounds: (
+                Background::Color(t.surface_2),
+                Background::Color(t.surface_2),
+            ),
+            width: 4.0,
+            border: Border {
+                radius: 999.0.into(),
+                ..Border::default()
             },
-            handle: slider_widget::Handle {
-                shape: slider_widget::HandleShape::Circle { radius: 7.0 },
-                background: Background::Color(t.text_4),
-                border_width: 0.0,
-                border_color: Color::TRANSPARENT,
-            },
-        }
+        },
+        handle: slider_widget::Handle {
+            shape: slider_widget::HandleShape::Circle { radius: 7.0 },
+            background: Background::Color(t.text_4),
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+        },
     })
 }
 
 /// A toggle: accent track when on, a surface-3 track when off, a text knob.
+#[cfg(test)]
 pub(crate) fn toggler(scheme: Scheme) -> toggler_widget::StyleFn<'static, Theme> {
+    toggler_at(*scheme.tokens())
+}
+
+pub(crate) fn toggler_at(t: Tokens) -> toggler_widget::StyleFn<'static, Theme> {
     Box::new(move |_theme, status| {
-        let t = scheme.tokens();
         let (track, knob) = match status {
             toggler_widget::Status::Active { is_toggled }
             | toggler_widget::Status::Hovered { is_toggled } => {
@@ -569,9 +770,13 @@ pub(crate) fn toggler(scheme: Scheme) -> toggler_widget::StyleFn<'static, Theme>
 }
 
 /// A dimmed toggle for an unknown value: surface-2 track, text-4 knob.
+#[cfg(test)]
 pub(crate) fn dim_toggler(scheme: Scheme) -> toggler_widget::StyleFn<'static, Theme> {
+    dim_toggler_at(*scheme.tokens())
+}
+
+pub(crate) fn dim_toggler_at(t: Tokens) -> toggler_widget::StyleFn<'static, Theme> {
     Box::new(move |_theme, status| {
-        let t = scheme.tokens();
         let (track, knob) = match status {
             toggler_widget::Status::Active { is_toggled }
             | toggler_widget::Status::Hovered { is_toggled } => (
@@ -601,9 +806,13 @@ pub(crate) fn dim_toggler(scheme: Scheme) -> toggler_widget::StyleFn<'static, Th
 }
 
 /// A checkbox: accent fill when checked, a well box when not.
+#[cfg(test)]
 pub(crate) fn checkbox(scheme: Scheme) -> checkbox_widget::StyleFn<'static, Theme> {
+    checkbox_at(*scheme.tokens())
+}
+
+pub(crate) fn checkbox_at(t: Tokens) -> checkbox_widget::StyleFn<'static, Theme> {
     Box::new(move |_theme, status| {
-        let t = scheme.tokens();
         let (background, icon) = match status {
             checkbox_widget::Status::Active { is_checked }
             | checkbox_widget::Status::Hovered { is_checked } => (
@@ -636,18 +845,16 @@ pub(crate) fn checkbox(scheme: Scheme) -> checkbox_widget::StyleFn<'static, Them
 
 /// A card: surface-1 with a 1px line drawn as the border (iced has no shadow
 /// spread, so the card line is a border).
-pub(crate) fn card(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
-    move |_theme| {
-        let t = scheme.tokens();
-        container::Style {
-            background: Some(Background::Color(t.surface_1)),
-            border: Border {
-                radius: RADIUS_CARD.into(),
-                width: 1.0,
-                color: t.line,
-            },
-            ..container::Style::default()
-        }
+pub(crate) fn card_at(t: Tokens) -> impl Fn(&Theme) -> container::Style + 'static {
+    move |_theme| container::Style {
+        background: Some(Background::Color(t.surface_1)),
+        border: Border {
+            radius: RADIUS_CARD.into(),
+            width: 1.0,
+            color: t.line,
+        },
+        text_color: Some(t.text),
+        ..container::Style::default()
     }
 }
 
@@ -673,18 +880,15 @@ pub(crate) fn sidebar(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + '
 }
 
 /// A neutral mark tag: text-3 on a quiet surface tint, pill radius.
-pub(crate) fn tag(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
-    move |_theme| {
-        let t = scheme.tokens();
-        container::Style {
-            background: Some(Background::Color(t.surface_2)),
-            text_color: Some(t.text_3),
-            border: Border {
-                radius: 999.0.into(),
-                ..Border::default()
-            },
-            ..container::Style::default()
-        }
+pub(crate) fn tag_at(t: Tokens) -> impl Fn(&Theme) -> container::Style + 'static {
+    move |_theme| container::Style {
+        background: Some(Background::Color(t.surface_2)),
+        text_color: Some(t.text_3),
+        border: Border {
+            radius: 999.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
     }
 }
 
@@ -694,17 +898,18 @@ const WARNING_TINT: f32 = 0.10;
 
 /// A warning-tone tag, for the `Untested` badge.
 pub(crate) fn tag_warning(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
-    move |_theme| {
-        let t = scheme.tokens();
-        container::Style {
-            background: Some(Background::Color(tint(t.warning, WARNING_TINT))),
-            text_color: Some(t.warning),
-            border: Border {
-                radius: 999.0.into(),
-                ..Border::default()
-            },
-            ..container::Style::default()
-        }
+    tag_warning_at(*scheme.tokens())
+}
+
+pub(crate) fn tag_warning_at(t: Tokens) -> impl Fn(&Theme) -> container::Style + 'static {
+    move |_theme| container::Style {
+        background: Some(Background::Color(tint(t.warning, WARNING_TINT))),
+        text_color: Some(t.warning),
+        border: Border {
+            radius: 999.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
     }
 }
 
@@ -733,14 +938,12 @@ fn banner_style(
 }
 
 /// The error banner: danger text on a danger tint.
-pub(crate) fn banner(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
-    let t = scheme.tokens();
+pub(crate) fn banner_at(t: Tokens) -> impl Fn(&Theme) -> container::Style + 'static {
     banner_style(tint(t.danger, 0.14), t.danger_text, t.line)
 }
 
 /// The outside-change banner: warning text on the shared warning tint.
-pub(crate) fn banner_warning(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'static {
-    let t = scheme.tokens();
+pub(crate) fn banner_warning_at(t: Tokens) -> impl Fn(&Theme) -> container::Style + 'static {
     banner_style(tint(t.warning, WARNING_TINT), t.warning, t.line)
 }
 
@@ -777,21 +980,21 @@ pub(crate) fn scrim(scheme: Scheme) -> impl Fn(&Theme) -> container::Style + 'st
 
 /// A divider drawn in `line`.
 pub(crate) fn rule(scheme: Scheme) -> impl Fn(&Theme) -> rule::Style + 'static {
-    move |_theme| {
-        let t = scheme.tokens();
-        rule::Style {
-            color: t.line,
-            radius: 0.0.into(),
-            fill_mode: rule::FillMode::Full,
-            snap: true,
-        }
+    rule_at(*scheme.tokens())
+}
+
+pub(crate) fn rule_at(t: Tokens) -> impl Fn(&Theme) -> rule::Style + 'static {
+    move |_theme| rule::Style {
+        color: t.line,
+        radius: 0.0.into(),
+        fill_mode: rule::FillMode::Full,
+        snap: true,
     }
 }
 
 /// The page's scrollable: a transparent container, a quiet rail.
-pub(crate) fn scrollable(scheme: Scheme) -> scrollable_widget::StyleFn<'static, Theme> {
+pub(crate) fn scrollable_at(t: Tokens) -> scrollable_widget::StyleFn<'static, Theme> {
     Box::new(move |_theme, status| {
-        let t = scheme.tokens();
         let (dragged, hovered) = match status {
             scrollable_widget::Status::Active { .. } => (false, false),
             scrollable_widget::Status::Hovered {

@@ -153,19 +153,10 @@ impl EffectKind {
 
     /// The CLI token title-cased: `pulse-one` -> `Pulse one`.
     pub(crate) fn label(self) -> String {
-        let token = self.token();
-        let mut chars = token.chars();
-        match chars.next() {
-            Some(first) => {
-                let mut out = first.to_uppercase().collect::<String>();
-                out.push_str(chars.as_str());
-                out.replace('-', " ")
-            }
-            None => String::new(),
-        }
+        parse::effect_label(self.token())
     }
 
-    fn token(self) -> &'static str {
+    pub(crate) fn token(self) -> &'static str {
         match self {
             EffectKind::Off => "off",
             EffectKind::Glorious => "glorious",
@@ -177,6 +168,11 @@ impl EffectKind {
             EffectKind::Rave => "rave",
             EffectKind::Wave => "wave",
         }
+    }
+
+    /// The effect a CLI name names, or `None` for a name the CLI rejects.
+    pub(crate) fn from_token(token: &str) -> Option<EffectKind> {
+        Self::ALL.into_iter().find(|kind| kind.token() == token)
     }
 }
 
@@ -2603,7 +2599,7 @@ fn switch_effect(current: Option<&Effect>, kind: EffectKind) -> Effect {
     build_effect(kind, rate, colors)
 }
 
-fn kind_of(effect: &Effect) -> EffectKind {
+pub(crate) fn kind_of(effect: &Effect) -> EffectKind {
     match effect {
         Effect::Off => EffectKind::Off,
         Effect::Glorious { .. } => EffectKind::Glorious,
@@ -2640,7 +2636,7 @@ fn effect_colors_of(effect: Option<&Effect>) -> Vec<Rgb> {
     }
 }
 
-fn build_effect(kind: EffectKind, rate: Rate, colors: Vec<Rgb>) -> Effect {
+pub(crate) fn build_effect(kind: EffectKind, rate: Rate, colors: Vec<Rgb>) -> Effect {
     match kind {
         EffectKind::Off => Effect::Off,
         EffectKind::Glorious => Effect::Glorious { rate },

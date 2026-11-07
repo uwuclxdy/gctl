@@ -1128,6 +1128,7 @@ dependencies = [
  "hidapi",
  "iced",
  "iced_test",
+ "mundy",
  "serde",
  "tempfile",
  "thiserror 2.0.21",

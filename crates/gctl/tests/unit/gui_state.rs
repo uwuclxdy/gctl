@@ -1491,7 +1491,7 @@ fn the_device_section_never_holds_pending_edits() {
     assert_eq!(state.plan(Section::Device), Ok(Vec::new()));
 }
 
-// --- edits across reloads (review round 3) ----------------------------------------
+// --- edits across reloads ----------------------------------------
 
 /// The fake mouse with profile 3 open for editing while profile 2 stays active.
 fn editing_three(state: &mut State) {
@@ -1691,7 +1691,7 @@ fn a_stage_value_edit_keeps_the_edited_active_stage() {
     );
 }
 
-// --- what the window says (review round 3) ----------------------------------------
+// --- what the window says ----------------------------------------
 
 #[test]
 fn a_write_failure_shows_above_the_memory_refusal() {
@@ -1786,7 +1786,7 @@ fn only_the_import_answers_close_the_import_question() {
     );
 }
 
-// --- after a successful Apply (review round 4) ------------------------------------
+// --- after a successful Apply ------------------------------------
 
 fn apply_stage_three(state: &mut State) {
     edit(state, Edit::ActiveStage(3));
@@ -2048,7 +2048,7 @@ fn a_queued_import_question_holds_the_line_until_it_is_answered() {
     );
 }
 
-// --- import edges (review round 4) ------------------------------------------------
+// --- import edges ------------------------------------------------
 
 #[test]
 fn an_import_that_never_started_shows_its_failure_once() {
@@ -2099,7 +2099,7 @@ fn an_import_question_waits_for_an_open_discard_question() {
     assert_eq!(state.section(), Section::Performance);
 }
 
-// --- when an edit ends (review round 6) -------------------------------------------
+// --- when an edit ends -------------------------------------------
 //
 // an edit ends at the first good read after a successful write that carried its
 // field, and only when that read shows exactly the edit's value; or when the user
@@ -2290,7 +2290,7 @@ fn discarding_to_switch_profile_during_a_read_switches_after_it() {
     );
 }
 
-// --- written entries wait for a good read (review round 7) ----------------------
+// --- written entries wait for a good read ----------------------
 
 fn transport_error() -> LoadError {
     LoadError::Transport("HID transport failed: gone".to_owned())
@@ -2752,7 +2752,7 @@ fn an_import_of_the_scroll_direction_ends_an_equal_scroll_wheel_bind_entry() {
     );
 }
 
-// --- the snapshot follows landed writes (review round 8) --------------------------
+// --- the snapshot follows landed writes --------------------------
 
 #[test]
 fn a_landed_write_whose_reread_failed_shows_its_value_at_once() {
@@ -2974,7 +2974,7 @@ fn a_failed_import_ends_the_entries_its_landed_ops_carried() {
     assert_eq!(state.polling_rate(), Some(PollingRate::Hz1000));
 }
 
-// --- a pick switches the window at once (review round 8) --------------------------
+// --- a pick switches the window at once --------------------------
 
 #[test]
 fn a_pick_switches_the_edited_profile_at_once() {
@@ -3039,7 +3039,7 @@ fn a_read_of_the_profile_left_behind_never_shows() {
     assert_eq!(state.debounce(), None);
 }
 
-// --- emptied sleep fields (review round 8) ----------------------------------------
+// --- emptied sleep fields ----------------------------------------
 
 #[test]
 fn an_emptied_sleep_minutes_field_blocks_apply() {
@@ -3078,7 +3078,7 @@ fn unticking_never_fills_the_sleep_fields_with_zero() {
     );
 }
 
-// --- the write-only half comes from the memory file (review round 9) -------------
+// --- the write-only half comes from the memory file -------------
 
 fn invert_binds(memory: &mut Memory) {
     for id in 1..=3 {
@@ -3185,7 +3185,7 @@ fn an_unreadable_memory_after_a_write_reads_write_only_values_as_unknown() {
     assert_eq!(state.debounce(), Some(4));
 }
 
-// --- a write's answer compares every field its plan carried (review round 9) ------
+// --- a write's answer compares every field its plan carried ------
 
 #[test]
 fn an_edit_back_during_a_write_whose_op_failed_ends_at_the_answer() {
@@ -3272,7 +3272,7 @@ fn a_failed_write_whose_reread_shows_its_value_ends_the_entry() {
     assert_eq!(state.debounce(), Some(7));
 }
 
-// --- picks and questions (review round 9) ----------------------------------------
+// --- picks and questions ----------------------------------------
 
 #[test]
 fn a_pick_during_a_background_read_switches_at_once() {
@@ -3329,7 +3329,7 @@ fn nothing_starts_while_a_question_is_open() {
     );
 }
 
-// --- what may start, decided in one place (review round 10) -----------------------
+// --- what may start, decided in one place -----------------------
 
 #[test]
 fn a_pick_during_a_write_is_refused_even_with_pending_edits() {
@@ -3998,7 +3998,7 @@ fn the_banner_stays_through_a_reconnect_writes_and_reads() {
     assert!(state.outside_change(), "only Dismiss clears it");
 }
 
-// --- other writers, review round 1 ----------------------------------------------
+// --- other writers ----------------------------------------------
 
 #[test]
 fn a_failed_import_keeps_its_notice_beside_the_moved_lines() {
@@ -4220,7 +4220,7 @@ fn a_cable_or_dongle_switch_starts_a_fresh_baseline() {
     );
 }
 
-// --- other writers, review round 2: a moved line lives only with its entry ------
+// --- other writers: a moved line lives only with its entry ------
 
 #[test]
 fn a_section_discard_drops_the_lines_of_the_entries_it_drops() {
@@ -4314,7 +4314,7 @@ fn an_import_that_never_reached_the_mouse_owns_no_field() {
     assert!(state.outside_change());
 }
 
-// --- other writers, review round 3: every line ends with its own entry ----------
+// --- other writers: every line ends with its own entry ----------
 
 /// Edit, open the discard question, let the background read move the field,
 /// then Discard: the line shows while the entry lives and ends with it.
@@ -4607,7 +4607,7 @@ fn a_failed_list_write_that_landed_under_a_live_entry_is_no_line() {
     assert!(!state.outside_change());
 }
 
-// --- other writers, review round 4: a write owns only what it may have sent -------
+// --- other writers: a write owns only what it may have sent -------
 
 #[test]
 fn an_apply_that_never_reached_the_mouse_owns_no_field() {
@@ -4689,7 +4689,7 @@ fn an_apply_that_failed_on_its_first_report_owns_that_field() {
     assert!(!state.outside_change());
 }
 
-// --- other writers, review round 5: the mouse refused before the report ----------
+// --- other writers: the mouse refused before the report ----------
 
 #[test]
 fn a_stage_pick_the_mouse_refused_before_its_report_shows_the_outside_shrink() {
@@ -4728,7 +4728,7 @@ fn a_stage_pick_the_mouse_refused_before_its_report_shows_the_outside_shrink() {
     );
 }
 
-// --- other writers, review rounds 6-7: an import's failing op and its re-read -----
+// --- other writers: an import's failing op and its re-read -----
 
 const UNPLUGGED: &str = "HID transport failed: device unplugged";
 

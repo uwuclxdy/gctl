@@ -10,6 +10,7 @@ fn main() -> std::process::ExitCode {
 fn run_main() -> u8 {
     let state_dir = gctl::state_dir(&|key| std::env::var_os(key));
     let lock_path = gctl::lock_path(&|key| std::env::var_os(key), state_dir.as_deref());
+    let kdeglobals = gctl::kdeglobals_path(&|key| std::env::var_os(key));
 
     // The device lock, taken lazily and held until exit.
     let mut lock_file: Option<File> = None;
@@ -54,7 +55,7 @@ fn run_main() -> u8 {
 
     match outcome {
         Outcome::Exit(code) => code,
-        Outcome::Gui => match gctl::gui::run(state_dir.as_deref(), lock_path) {
+        Outcome::Gui => match gctl::gui::run(state_dir.as_deref(), lock_path, kdeglobals) {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("error: {error}");

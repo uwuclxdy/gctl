@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, llvm-tools-preview
       - name: hidapi and pkg-config for the build scripts
         run: |
           sudo apt-get update
@@ -59,12 +59,20 @@ jobs:
           echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-llvm-cov
       - name: clippy (-D warnings)
         run: cargo clippy --all-targets --all-features --release --locked --workspace -- -D warnings
       - name: clippy gctl-proto without its default feature
         run: cargo clippy -p gctl-proto --all-targets --no-default-features --release --locked -- -D warnings
-      - name: test
-        run: cargo nextest run --release --all-features --locked --workspace --no-fail-fast
+      - name: test (coverage)
+        run: cargo llvm-cov nextest --release --all-features --locked --workspace --no-fail-fast --lcov --output-path lcov.info
+      - name: upload coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: lcov.info
+          if-no-files-found: error
+          retention-days: 7
+          path: lcov.info
       - name: doctests
         shell: bash
         run: |
@@ -131,3 +139,29 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
         run: cargo audit
+
+  # The only job with a write token, so it never meets build code: the report
+  # lands on the repo's own coverage branch via the Git Data API.
+  coverage:
+    needs: check
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: lcov.info
+      - name: octocov
+        env:
+          OCTOCOV_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsSL -o octocov_v0.83.5_linux_amd64.tar.gz https://github.com/k1LoW/octocov/releases/download/v0.83.5/octocov_v0.83.5_linux_amd64.tar.gz
+          echo "3aa6973a8e68036b640dac6ef0c5456dda12289c7abbdaf7b919a036555d8e9c  octocov_v0.83.5_linux_amd64.tar.gz" | sha256sum -c -
+          tar -xf octocov_v0.83.5_linux_amd64.tar.gz octocov
+          ./octocov

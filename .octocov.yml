@@ -1,0 +1,35 @@
+repository: uwuclxdy/gctl
+coverage:
+  paths:
+    - lcov.info
+  exclude:
+    - "target/**"
+    - "vendor/**"
+  acceptable: patch >= 70%
+  if: true
+codeToTestRatio:
+  code:
+    - "crates/*/src/**/*.rs"
+  test:
+    - "crates/*/tests/**/*.rs"
+  if: true
+testExecutionTime:
+  steps:
+    - test (coverage)
+  if: true
+comment:
+  if: is_pull_request && !github.event.pull_request.head.repo.fork
+  updatePrevious: true
+  expandDetails: true
+  hideFooterLink: true
+  hideCoverageLink: true
+summary:
+  if: true
+report:
+  if: is_default_branch
+  datastores:
+    - github://uwuclxdy/gctl@coverage/reports
+diff:
+  if: is_pull_request
+  datastores:
+    - github://uwuclxdy/gctl@coverage/reports

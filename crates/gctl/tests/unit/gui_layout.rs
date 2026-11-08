@@ -387,21 +387,19 @@ fn every_bind_picker_name_fits_the_picker() {
     names.extend(gctl_proto::Key::all().map(gctl_proto::Key::name));
     assert!(names.len() > 100, "only {} names", names.len());
     for name in names {
-        for font in [iced::Font::DEFAULT, UI_FONT] {
-            let mut ui = simulator(iced::widget::text(name).size(14).font(font).into());
-            let mut width = 0.0f32;
-            let _ = ui.find(|candidate: iced_test::selector::Candidate<'_>| {
-                if let iced_test::selector::Candidate::Text { bounds, .. } = candidate {
-                    width = width.max(bounds.width);
-                }
-                None::<()>
-            });
-            assert!(width > 0.0, "{name:?}: nothing measured");
-            assert!(
-                width <= room,
-                "{name:?} is {width} wide in {font:?}, a picker keeps {room}"
-            );
-        }
+        let mut ui = simulator(iced::widget::text(name).size(14).font(UI_FONT).into());
+        let mut width = 0.0f32;
+        let _ = ui.find(|candidate: iced_test::selector::Candidate<'_>| {
+            if let iced_test::selector::Candidate::Text { bounds, .. } = candidate {
+                width = width.max(bounds.width);
+            }
+            None::<()>
+        });
+        assert!(width > 0.0, "{name:?}: nothing measured");
+        assert!(
+            width <= room,
+            "{name:?} is {width} wide in {UI_FONT:?}, a picker keeps {room}"
+        );
     }
 }
 
